@@ -35,7 +35,7 @@ from aiohttp import (
 )
 from multidict import CIMultiDict
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 ConfigurationValue = TypeVar("ConfigurationValue")
 CONFIGURATION_PARSE_ERRORS: list[str] = []
 CONFIGURATION_INVALID_NAMES: set[str] = set()
