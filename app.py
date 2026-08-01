@@ -1,469 +1,1577 @@
 #!/usr/bin/env python3
-"""
-SillyTavern SSO Sidecar — transparent reverse proxy that:
-1. Reads X-Authentik-Uid (stable UUID) from Authentik outpost headers
-2. Maps uid → existing ST handle via _storage records (ssoUid field)
-3. Auto-creates ST account if uid is new (admin session via passwordless login)
-4. Rewrites X-Authentik-Username to the mapped handle so ST's native SSO kicks in
-"""
+"""Secure Authentik-to-SillyTavern SSO sidecar and narrow LLM API relay."""
+
+from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
+import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
+import tempfile
+import threading
 import time
-import logging
-from typing import Optional
-from aiohttp import web, ClientSession, ClientTimeout
+import unicodedata
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from http.cookies import SimpleCookie
+from typing import Any
+from urllib.parse import urlsplit
 
-# ─── Config ──────────────────────────────────────────────────────────────────
-ST_BACKEND = os.getenv("ST_BACKEND", "http://sillytavern:8000")
+from aiohttp import (
+    ClientError,
+    ClientSession,
+    ClientTimeout,
+    CookieJar,
+    DummyCookieJar,
+    web,
+)
+from multidict import CIMultiDict
+
+VERSION = "0.2.0"
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be true or false")
+
+
+def csv_values(value: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
+def env_secret(name: str) -> str:
+    """Read a secret from NAME or NAME_FILE, never both."""
+    value = os.getenv(name)
+    file_path = os.getenv(f"{name}_FILE")
+    if value is not None and file_path:
+        raise ValueError(f"set only one of {name} and {name}_FILE")
+    if file_path:
+        try:
+            with open(file_path, "r", encoding="utf-8") as file:
+                return file.read().rstrip("\r\n")
+        except OSError as exc:
+            raise ValueError(f"cannot read {name}_FILE: {exc}") from exc
+    return value or ""
+
+
+def parse_trusted_networks(value: str) -> tuple[ipaddress._BaseNetwork, ...]:
+    return tuple(ipaddress.ip_network(item, strict=False) for item in csv_values(value))
+
+
+# SillyTavern connection and account provisioning.
+ST_BACKEND = os.getenv("ST_BACKEND", "http://sillytavern:8000").rstrip("/")
 LISTEN_PORT = int(os.getenv("LISTEN_PORT", "8001"))
-# Upstream API channel. The sidecar proxies /v1/* to this base URL and injects
-# the real API key server-side, so users never see it in their browser.
-API_BASE_URL = os.getenv("API_BASE_URL", "https://api.example.com/v1").rstrip("/")
-API_KEY = os.getenv("API_KEY", "")
-ALLOWED_MODELS = {m.strip() for m in os.getenv("ALLOWED_MODELS", "deepseek-v4-flash").split(",") if m.strip()}
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", next(iter(ALLOWED_MODELS), "deepseek-v4-flash"))
-# Browser-facing endpoint written into user settings (routes back through this sidecar)
-API_URL_FOR_USERS = os.getenv("ST_API_BASE", "https://st.example.com/v1").rstrip("/")
-# admin handle used for auto-provisioning (must be passwordless + enabled)
-ADMIN_HANDLE = os.getenv("ADMIN_HANDLE", "admin")
-# groups that grant admin in SillyTavern
-ADMIN_GROUPS = set(os.getenv("ADMIN_GROUPS", "admins,staff").split(","))
-# Root of the SillyTavern data directory (mounted into this container)
+ADMIN_HANDLE = os.getenv("ADMIN_HANDLE", "admin").strip()
+ADMIN_PASSWORD = env_secret("ADMIN_PASSWORD")
+USER_PASSWORD_SECRET = env_secret("USER_PASSWORD_SECRET")
+ADMIN_GROUPS = frozenset(csv_values(os.getenv("ADMIN_GROUPS", "admins,staff")))
+AUTO_PROVISION = env_bool("AUTO_PROVISION", True)
+ALLOW_USERNAME_LINKING = env_bool("ALLOW_USERNAME_LINKING", False)
+
+# Authentik is trusted only when its TCP source address is explicitly listed.
+TRUSTED_PROXY_CIDRS = os.getenv("TRUSTED_PROXY_CIDRS", "")
+try:
+    TRUSTED_PROXY_NETWORKS = parse_trusted_networks(TRUSTED_PROXY_CIDRS)
+    TRUSTED_PROXY_ERROR = ""
+except ValueError as exc:
+    TRUSTED_PROXY_NETWORKS = ()
+    TRUSTED_PROXY_ERROR = str(exc)
+
+# Read-only legacy data access is used only to migrate old ssoUid records.
 ST_DATA_DIR = os.getenv("ST_DATA_DIR", "/st-data/data")
-# slugify rule matching ST's lodash.slugify
+STATE_FILE = os.getenv("STATE_FILE", "/var/lib/sso-sidecar/mappings.json")
+
+# Narrow, service-authenticated OpenAI-compatible relay.
+API_PROXY_ENABLED = env_bool("API_PROXY_ENABLED", True)
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api.example.com/v1").rstrip("/")
+API_KEY = env_secret("API_KEY")
+API_PROXY_TOKEN = env_secret("API_PROXY_TOKEN")
+ALLOWED_MODELS = csv_values(os.getenv("ALLOWED_MODELS", "deepseek-v4-flash"))
+ALLOWED_MODEL_SET = frozenset(ALLOWED_MODELS)
+DEFAULT_MODEL = os.getenv(
+    "DEFAULT_MODEL",
+    ALLOWED_MODELS[0] if ALLOWED_MODELS else "deepseek-v4-flash",
+).strip()
+# SillyTavern calls custom endpoints server-side, so this should be an internal URL.
+API_URL_FOR_USERS = os.getenv("ST_API_BASE", "http://sso-sidecar:8001/v1").rstrip("/")
+API_MAX_BODY_BYTES = int(os.getenv("API_MAX_BODY_BYTES", str(10 * 1024 * 1024)))
+SSO_MAX_BODY_BYTES = int(os.getenv("SSO_MAX_BODY_BYTES", str(500 * 1024 * 1024)))
+UID_CACHE_TTL = int(os.getenv("UID_CACHE_TTL", "300"))
+SSO_BINDING_COOKIE_SECURE = env_bool("SSO_BINDING_COOKIE_SECURE", True)
+
 SLUG_RE = re.compile(r"[^a-z0-9]+")
+SAFE_UID_RE = re.compile(r"^[A-Za-z0-9._:@-]{1,512}$")
+HEX_DIGEST_RE = re.compile(r"^[a-f0-9]{64}$")
+SSO_BINDING_COOKIE_NAME = "sso-sidecar-binding"
+SSO_BINDING_COOKIE_MAX_AGE = 400 * 24 * 60 * 60
+ST_SESSION_COOKIE_RE = re.compile(r"^session-[a-f0-9]{8}(?:\.sig)?$", re.IGNORECASE)
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [SSO] %(levelname)s %(message)s",
 )
 log = logging.getLogger("sso-sidecar")
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+class StateError(RuntimeError):
+    """The sidecar mapping state is invalid or unavailable."""
+
+
+class ProvisioningError(RuntimeError):
+    """SillyTavern provisioning failed and may be retried."""
+
+
+class IdentityConflict(RuntimeError):
+    """An SSO identity would take over or collide with another account."""
+
+
+@dataclass(frozen=True)
+class MappingRecord:
+    handle: str
+    provisioned: bool
+    managed: bool
+    api_config_digest: str
+
+
+@dataclass(frozen=True)
+class CachedIdentity:
+    handle: str
+    expected_admin: bool
+    expires_at: float
+
+
+@dataclass
+class BodyStreamState:
+    actual_size: int = 0
+    exceeded_limit: bool = False
+
+
+UID_CACHE_KEY = web.AppKey("uid_cache", dict)
+PROVISION_LOCK_KEY = web.AppKey("provision_lock", asyncio.Lock)
+_STATE_LOCK = threading.RLock()
+
 
 def slugify(text: str) -> str:
-    """Match ST's slugify: deburr(lower(trim)) → [^a-z0-9]+ → '-' → strip hyphens."""
-    import unicodedata
-    text = text.strip().lower()
-    # deburr: strip diacritical marks (NFKD → keep ASCII)
-    text = unicodedata.normalize("NFKD", text)
-    text = "".join(c for c in text if not unicodedata.combining(c))
-    text = SLUG_RE.sub("-", text)
-    return text.strip("-")
+    """Match SillyTavern's lodash-based handle slugification."""
+    normalized = unicodedata.normalize("NFKD", text.strip().lower())
+    normalized = "".join(
+        character for character in normalized if not unicodedata.combining(character)
+    )
+    return SLUG_RE.sub("-", normalized).strip("-")
 
 
 def storage_path(handle: str) -> str:
-    """Where ST stores user:<handle> as a JSON file in _storage."""
-    # ST uses sha256 hash of the key as filename
-    import hashlib
-    key = f"user:{handle}"
-    fname = hashlib.sha256(key.encode()).hexdigest()
-    return os.path.join(ST_DATA_DIR, "_storage", fname)
+    """Return the legacy node-persist record path for a SillyTavern handle."""
+    filename = hashlib.sha256(f"user:{handle}".encode()).hexdigest()
+    return os.path.join(ST_DATA_DIR, "_storage", filename)
 
 
-def read_user_record(handle: str) -> Optional[dict]:
-    """Read a ST user record from disk (sidecar mounts the same volume)."""
-    path = storage_path(handle)
-    if not os.path.exists(path):
+def _unwrap_user_record(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
         return None
+    value = raw.get("value", raw)
+    return value if isinstance(value, dict) else None
+
+
+def read_user_record(handle: str) -> dict[str, Any] | None:
+    """Read a legacy SillyTavern user record without ever modifying it."""
     try:
-        with open(path, "r") as f:
-            data = json.load(f)
-        return data.get("value", data)
-    except (json.JSONDecodeError, IOError):
+        with open(storage_path(handle), "r", encoding="utf-8") as file:
+            return _unwrap_user_record(json.load(file))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return None
 
 
-def write_user_record(handle: str, user: dict) -> bool:
-    """Write a ST user record back to disk (adding ssoUid field)."""
-    path = storage_path(handle)
-    key = f"user:{handle}"
-    try:
-        with open(path, "r") as f:
-            raw = json.load(f)
-        raw["value"] = user
-        with open(path, "w") as f:
-            json.dump(raw, f)
-        return True
-    except (IOError, json.JSONDecodeError) as e:
-        log.error(f"Failed to write user record for {handle}: {e}")
-        return False
-
-
-def find_handle_by_uid(uid: str) -> Optional[str]:
-    """Scan all user records for a matching ssoUid field."""
+def _iter_legacy_users() -> list[dict[str, Any]]:
     storage_dir = os.path.join(ST_DATA_DIR, "_storage")
-    if not os.path.isdir(storage_dir):
-        return None
-    for fname in os.listdir(storage_dir):
-        path = os.path.join(storage_dir, fname)
-        try:
-            with open(path, "r") as f:
-                data = json.load(f)
-            user = data.get("value", data)
-            if user.get("ssoUid") == uid:
-                return user.get("handle")
-        except (json.JSONDecodeError, IOError):
-            continue
-    return None
-
-
-def find_handle_by_username(username: str) -> Optional[dict]:
-    """Find user by handle (fallback for pre-existing accounts without ssoUid)."""
-    handle = slugify(username)
-    user = read_user_record(handle)
-    if user and user.get("enabled", True):
-        return {"handle": handle, "user": user}
-    return None
-
-
-# ─── ST API Client ────────────────────────────────────────────────────────────
-
-async def st_get_csrf(session: ClientSession) -> tuple[str, str]:
-    """Get CSRF token + session cookie from ST."""
-    async with session.get(f"{ST_BACKEND}/csrf-token") as resp:
-        data = await resp.json()
-        token = data.get("token", "")
-        # aiohttp keeps cookies automatically via cookie_jar
-        return token
-
-
-async def st_admin_login(session: ClientSession, csrf: str) -> bool:
-    """Login as admin (passwordless account) to get an admin session."""
-    headers = {"Content-Type": "application/json", "x-csrf-token": csrf}
-    async with session.post(
-        f"{ST_BACKEND}/api/users/login",
-        json={"handle": ADMIN_HANDLE},
-        headers=headers,
-    ) as resp:
-        if resp.status == 200:
-            log.info(f"Admin login successful as '{ADMIN_HANDLE}'")
-            return True
-        body = await resp.text()
-        log.warning(f"Admin login failed ({resp.status}): {body[:200]}")
-        return False
-
-
-async def st_create_user(session: ClientSession, csrf: str, handle: str, name: str, is_admin: bool) -> bool:
-    """Create a new ST user via admin API."""
-    headers = {"Content-Type": "application/json", "x-csrf-token": csrf}
-    body = {"handle": handle, "name": name, "admin": is_admin}
-    async with session.post(
-        f"{ST_BACKEND}/api/users/create",
-        json=body,
-        headers=headers,
-    ) as resp:
-        if resp.status == 200:
-            log.info(f"Created ST user: handle={handle}, name={name}, admin={is_admin}")
-            return True
-        text = await resp.text()
-        log.error(f"Create user failed ({resp.status}): {text[:300]}")
-        return False
-
-
-# ─── Default API config injection ────────────────────────────────────────────
-
-def apply_default_api_config(handle: str) -> bool:
-    """
-    Write the default (sidecar-proxied) API connection into a user's settings.
-    The real channel key never touches user data — only a placeholder is stored,
-    and the sidecar injects the real key at request time.
-    """
-    user_dir = os.path.join(ST_DATA_DIR, handle)
-    settings_path = os.path.join(user_dir, "settings.json")
-    secrets_path = os.path.join(user_dir, "secrets.json")
     try:
-        if os.path.exists(settings_path):
-            with open(settings_path, "r", encoding="utf-8") as f:
-                settings = json.load(f)
-            oai = settings.setdefault("oai_settings", {})
-            oai["chat_completion_source"] = "custom"
-            oai["custom_url"] = API_URL_FOR_USERS
-            oai["custom_model"] = DEFAULT_MODEL
-            oai["openai_model"] = DEFAULT_MODEL
-            settings["main_api"] = "openai"
-            with open(settings_path, "w", encoding="utf-8") as f:
-                json.dump(settings, f, ensure_ascii=False, indent=2)
-        secrets = {}
-        if os.path.exists(secrets_path):
-            with open(secrets_path, "r", encoding="utf-8") as f:
-                secrets = json.load(f)
-        secrets["api_key_custom"] = "sk-st-sidecar-placeholder"
-        with open(secrets_path, "w", encoding="utf-8") as f:
-            json.dump(secrets, f, ensure_ascii=False, indent=2)
-        log.info(f"Injected default API config for '{handle}' → {API_URL_FOR_USERS}")
-        return True
-    except Exception as e:
-        log.error(f"apply_default_api_config({handle}) failed: {e}")
-        return False
+        entries = list(os.scandir(storage_dir))
+    except OSError:
+        return []
+
+    users: list[dict[str, Any]] = []
+    for entry in entries:
+        if not entry.is_file(follow_symlinks=False):
+            continue
+        try:
+            with open(entry.path, "r", encoding="utf-8") as file:
+                user = _unwrap_user_record(json.load(file))
+            if user is not None:
+                users.append(user)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+    return users
 
 
-# ─── Auto-provisioning ───────────────────────────────────────────────────────
+def _atomic_write_json(path: str, payload: dict[str, Any]) -> None:
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.",
+        dir=directory,
+        text=True,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2, sort_keys=True)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+    finally:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
 
-async def ensure_user(uid: str, username: str, display_name: str, groups: str) -> Optional[str]:
-    """
-    Given Authentik uid + username + groups, ensure a ST account exists.
-    Returns the ST handle to use, or None on failure.
-    """
-    # 1. Check if we already have a mapping by uid
-    existing_handle = find_handle_by_uid(uid)
-    if existing_handle:
-        log.debug(f"UID {uid} → existing handle {existing_handle}")
-        # Update username header to mapped handle
-        return existing_handle
 
-    # 2. Check if a user with this username already exists (pre-created)
-    existing = find_handle_by_username(username)
-    if existing:
-        handle = existing["handle"]
-        log.info(f"Found pre-existing handle '{handle}' for username '{username}', stamping ssoUid={uid}")
-        user = existing["user"]
-        user["ssoUid"] = uid
-        write_user_record(handle, user)
-        return handle
+def _empty_state() -> dict[str, Any]:
+    return {"version": 2, "mappings": {}}
 
-    # 3. Auto-create new account
-    handle = slugify(username)
-    if not handle:
-        log.warning(f"Cannot slugify username '{username}' to a valid handle")
-        return None
 
-    is_admin = any(g.strip() in ADMIN_GROUPS for g in groups.split(",")) if groups else False
+def _validate_mapping_value(
+    uid: Any,
+    value: Any,
+    source_version: int,
+) -> dict[str, Any]:
+    if not isinstance(uid, str) or not SAFE_UID_RE.fullmatch(uid):
+        raise StateError("mapping state contains an invalid UID")
 
-    timeout = ClientTimeout(total=10)
-    async with ClientSession(timeout=timeout) as session:
-        # Get CSRF token first (sets session cookie)
-        csrf = await st_get_csrf(session)
-        if not csrf:
-            log.error("Failed to get CSRF token from ST")
-            return None
+    if isinstance(value, str):
+        value = {
+            "handle": value,
+            "provisioned": True,
+            "managed": False,
+            "api_config_digest": "",
+        }
+    if not isinstance(value, dict):
+        raise StateError(f"mapping for UID {uid!r} is not an object")
 
-        # Login as admin
-        if not await st_admin_login(session, csrf):
-            log.error("Cannot auto-provision without admin session")
-            return None
-
-        # Get fresh CSRF after login (session changed)
-        csrf = await st_get_csrf(session)
-
-        # Create the user
-        if not await st_create_user(session, csrf, handle, display_name or username, is_admin):
-            return None
-
-    # 4. Stamp the new user record with ssoUid
-    user = read_user_record(handle)
-    if user:
-        user["ssoUid"] = uid
-        write_user_record(handle, user)
+    handle = value.get("handle")
+    managed = value.get("managed", False)
+    if source_version == 1:
+        configured = value.get("configured", True)
+        provisioned = configured if managed else True
+        api_config_digest = ""
     else:
-        log.warning(f"User {handle} created but record not found for stamping")
+        provisioned = value.get("provisioned", True)
+        api_config_digest = value.get("api_config_digest", "")
 
-    # 5. Write the default API connection so the new user works out of the box
-    apply_default_api_config(handle)
+    if not isinstance(handle, str) or not handle or slugify(handle) != handle:
+        raise StateError(f"mapping for UID {uid!r} has an invalid handle")
+    if not isinstance(provisioned, bool) or not isinstance(managed, bool):
+        raise StateError(f"mapping for UID {uid!r} has invalid flags")
+    if not isinstance(api_config_digest, str) or (
+        api_config_digest and not HEX_DIGEST_RE.fullmatch(api_config_digest)
+    ):
+        raise StateError(f"mapping for UID {uid!r} has an invalid API config digest")
+    if not managed and not provisioned:
+        raise StateError(f"unmanaged mapping for UID {uid!r} cannot be pending")
+    if not managed and api_config_digest:
+        raise StateError(
+            f"unmanaged mapping for UID {uid!r} cannot own API configuration"
+        )
+    return {
+        "handle": handle,
+        "provisioned": provisioned,
+        "managed": managed,
+        "api_config_digest": api_config_digest,
+    }
 
-    log.info(f"Auto-provisioned: uid={uid}, handle={handle}, admin={is_admin}")
+
+def _load_state_unlocked() -> dict[str, Any]:
+    if not os.path.exists(STATE_FILE):
+        return _empty_state()
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as file:
+            raw = json.load(file)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise StateError(f"cannot read mapping state: {exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise StateError("mapping state root is not an object")
+    source_version = raw.get("version", 1)
+    if source_version not in {1, 2}:
+        raise StateError(f"unsupported mapping state version: {source_version!r}")
+
+    raw_mappings = raw.get("mappings", raw.get("uid_to_handle", {}))
+    if not isinstance(raw_mappings, dict):
+        raise StateError("mapping state mappings field is not an object")
+
+    mappings: dict[str, dict[str, Any]] = {}
+    handles: dict[str, str] = {}
+    for uid, value in raw_mappings.items():
+        record = _validate_mapping_value(uid, value, source_version)
+        other_uid = handles.get(record["handle"])
+        if other_uid is not None and other_uid != uid:
+            raise StateError(f"handle {record['handle']!r} is bound to multiple UIDs")
+        mappings[uid] = record
+        handles[record["handle"]] = uid
+    return {"version": 2, "mappings": mappings}
+
+
+def _record_from_value(value: dict[str, Any]) -> MappingRecord:
+    return MappingRecord(
+        handle=value["handle"],
+        provisioned=value["provisioned"],
+        managed=value["managed"],
+        api_config_digest=value["api_config_digest"],
+    )
+
+
+def _legacy_handles_for_uid(uid: str) -> list[str]:
+    handles = {
+        user.get("handle")
+        for user in _iter_legacy_users()
+        if user.get("ssoUid") == uid and isinstance(user.get("handle"), str)
+    }
+    return sorted(handle for handle in handles if handle)
+
+
+def legacy_uid_for_handle(handle: str) -> str | None:
+    user = read_user_record(handle)
+    uid = user.get("ssoUid") if user else None
+    return uid if isinstance(uid, str) and uid else None
+
+
+def find_mapping(uid: str) -> MappingRecord | None:
+    """Read sidecar state and lazily import one unambiguous legacy ssoUid."""
+    with _STATE_LOCK:
+        state = _load_state_unlocked()
+        value = state["mappings"].get(uid)
+        if value is not None:
+            return _record_from_value(value)
+
+        legacy_handles = _legacy_handles_for_uid(uid)
+        if len(legacy_handles) > 1:
+            raise IdentityConflict("the legacy UID is bound to multiple handles")
+        if not legacy_handles:
+            return None
+        return save_mapping(uid, legacy_handles[0], provisioned=True, managed=False)
+
+
+def find_uid_by_handle(handle: str) -> str | None:
+    with _STATE_LOCK:
+        state = _load_state_unlocked()
+        matches = [
+            uid for uid, value in state["mappings"].items() if value["handle"] == handle
+        ]
+        if len(matches) > 1:
+            raise StateError(f"handle {handle!r} is bound to multiple UIDs")
+        if matches:
+            return matches[0]
+        return legacy_uid_for_handle(handle)
+
+
+def save_mapping(
+    uid: str,
+    handle: str,
+    *,
+    provisioned: bool,
+    managed: bool,
+    api_config_digest: str = "",
+) -> MappingRecord:
+    if not SAFE_UID_RE.fullmatch(uid):
+        raise IdentityConflict("the SSO UID has an invalid format")
+    if not handle or slugify(handle) != handle:
+        raise IdentityConflict("the SillyTavern handle is invalid")
+
+    with _STATE_LOCK:
+        state = _load_state_unlocked()
+        mappings = state["mappings"]
+        existing = mappings.get(uid)
+        if existing is not None and existing["handle"] != handle:
+            raise IdentityConflict("the UID is already bound to another handle")
+        for other_uid, value in mappings.items():
+            if other_uid != uid and value["handle"] == handle:
+                raise IdentityConflict("the handle is already bound to another UID")
+
+        if existing is not None:
+            provisioned = existing["provisioned"] or provisioned
+            managed = existing["managed"]
+            api_config_digest = existing["api_config_digest"] or api_config_digest
+        value = {
+            "handle": handle,
+            "provisioned": provisioned,
+            "managed": managed,
+            "api_config_digest": api_config_digest,
+        }
+        mappings[uid] = _validate_mapping_value(uid, value, 2)
+        _atomic_write_json(STATE_FILE, state)
+        return _record_from_value(mappings[uid])
+
+
+def mark_mapping_provisioned(
+    uid: str,
+    *,
+    reset_api_config: bool,
+) -> MappingRecord:
+    with _STATE_LOCK:
+        state = _load_state_unlocked()
+        value = state["mappings"].get(uid)
+        if value is None:
+            raise StateError("cannot provision a missing UID mapping")
+        if not value["managed"]:
+            raise StateError("cannot provision an unmanaged UID mapping")
+        value["provisioned"] = True
+        if reset_api_config:
+            value["api_config_digest"] = ""
+        _atomic_write_json(STATE_FILE, state)
+        return _record_from_value(value)
+
+
+def mark_mapping_api_configured(uid: str, digest: str) -> MappingRecord:
+    if not HEX_DIGEST_RE.fullmatch(digest):
+        raise StateError("cannot store an invalid API config digest")
+    with _STATE_LOCK:
+        state = _load_state_unlocked()
+        value = state["mappings"].get(uid)
+        if value is None:
+            raise StateError("cannot configure a missing UID mapping")
+        if not value["managed"] or not value["provisioned"]:
+            raise StateError("cannot configure an unmanaged or pending UID mapping")
+        value["api_config_digest"] = digest
+        _atomic_write_json(STATE_FILE, state)
+        return _record_from_value(value)
+
+
+def parse_authentik_groups(value: str) -> frozenset[str]:
+    """Authentik serializes proxy groups with a pipe delimiter."""
+    return frozenset(group.strip() for group in value.split("|") if group.strip())
+
+
+def groups_grant_admin(value: str) -> bool:
+    return bool(parse_authentik_groups(value) & ADMIN_GROUPS)
+
+
+def derive_user_password(uid: str) -> str:
+    digest = hmac.new(
+        USER_PASSWORD_SECRET.encode("utf-8"),
+        f"sso-sidecar:user:{uid}".encode(),
+        hashlib.sha256,
+    ).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def identity_binding_token(uid: str) -> str:
+    """Bind a browser's long-lived SillyTavern session to one stable SSO UID."""
+    return hmac.new(
+        USER_PASSWORD_SECRET.encode("utf-8"),
+        f"sso-sidecar:browser:{uid}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def request_has_valid_identity_binding(request: web.Request, uid: str) -> bool:
+    provided = request.cookies.get(SSO_BINDING_COOKIE_NAME, "")
+    return bool(
+        provided and secrets.compare_digest(provided, identity_binding_token(uid))
+    )
+
+
+def current_api_config_digest() -> str:
+    payload = json.dumps(
+        {
+            "schema": 1,
+            "url": API_URL_FOR_USERS,
+            "default_model": DEFAULT_MODEL,
+            "relay_token": API_PROXY_TOKEN,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+async def _safe_response_text(response: Any, limit: int = 300) -> str:
+    try:
+        return (await response.text())[:limit]
+    except (ClientError, UnicodeError, LookupError):
+        return "<unreadable response>"
+
+
+async def st_get_csrf(session: ClientSession) -> str:
+    try:
+        async with session.get(f"{ST_BACKEND}/csrf-token") as response:
+            if response.status != 200:
+                body = await _safe_response_text(response)
+                raise ProvisioningError(
+                    f"SillyTavern CSRF request failed ({response.status}): {body}"
+                )
+            payload = await response.json(content_type=None)
+    except (
+        ClientError,
+        asyncio.TimeoutError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+    ) as exc:
+        raise ProvisioningError(f"SillyTavern CSRF request failed: {exc}") from exc
+    token = payload.get("token") if isinstance(payload, dict) else None
+    if not isinstance(token, str) or not token:
+        raise ProvisioningError("SillyTavern returned an invalid CSRF token")
+    return token
+
+
+async def st_login(
+    session: ClientSession,
+    csrf: str,
+    handle: str,
+    password: str,
+) -> None:
+    headers = {"Content-Type": "application/json", "x-csrf-token": csrf}
+    try:
+        async with session.post(
+            f"{ST_BACKEND}/api/users/login",
+            json={"handle": handle, "password": password},
+            headers=headers,
+        ) as response:
+            if response.status != 200:
+                body = await _safe_response_text(response)
+                raise ProvisioningError(
+                    f"SillyTavern login for {handle!r} failed "
+                    f"({response.status}): {body}"
+                )
+    except (ClientError, asyncio.TimeoutError) as exc:
+        raise ProvisioningError(
+            f"SillyTavern login for {handle!r} failed: {exc}"
+        ) from exc
+
+
+async def st_verify_user_credentials(handle: str, password: str) -> None:
+    """Confirm that an existing account is still owned by the sidecar."""
+    timeout = ClientTimeout(total=15, sock_connect=5, sock_read=15)
+    async with ClientSession(
+        timeout=timeout,
+        cookie_jar=CookieJar(unsafe=True),
+    ) as session:
+        csrf = await st_get_csrf(session)
+        await st_login(session, csrf, handle, password)
+
+
+@asynccontextmanager
+async def st_admin_session() -> AsyncIterator[tuple[ClientSession, str]]:
+    timeout = ClientTimeout(total=15, sock_connect=5, sock_read=15)
+    async with ClientSession(
+        timeout=timeout,
+        cookie_jar=CookieJar(unsafe=True),
+    ) as session:
+        csrf = await st_get_csrf(session)
+        await st_login(session, csrf, ADMIN_HANDLE, ADMIN_PASSWORD)
+        csrf = await st_get_csrf(session)
+        yield session, csrf
+
+
+async def st_list_users(session: ClientSession, csrf: str) -> list[dict[str, Any]]:
+    headers = {"Content-Type": "application/json", "x-csrf-token": csrf}
+    try:
+        async with session.post(
+            f"{ST_BACKEND}/api/users/get",
+            json={},
+            headers=headers,
+        ) as response:
+            if response.status != 200:
+                body = await _safe_response_text(response)
+                raise ProvisioningError(
+                    f"SillyTavern user list failed ({response.status}): {body}"
+                )
+            payload = await response.json(content_type=None)
+    except (
+        ClientError,
+        asyncio.TimeoutError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+    ) as exc:
+        raise ProvisioningError(f"SillyTavern user list failed: {exc}") from exc
+    if not isinstance(payload, list) or not all(
+        isinstance(item, dict) for item in payload
+    ):
+        raise ProvisioningError("SillyTavern returned an invalid user list")
+    return payload
+
+
+async def st_create_user(
+    session: ClientSession,
+    csrf: str,
+    handle: str,
+    name: str,
+    password: str,
+    is_admin: bool,
+) -> str:
+    headers = {"Content-Type": "application/json", "x-csrf-token": csrf}
+    body = {
+        "handle": handle,
+        "name": name,
+        "password": password,
+        "admin": is_admin,
+    }
+    try:
+        async with session.post(
+            f"{ST_BACKEND}/api/users/create",
+            json=body,
+            headers=headers,
+        ) as response:
+            if response.status != 200:
+                response_body = await _safe_response_text(response)
+                raise ProvisioningError(
+                    f"SillyTavern user creation failed ({response.status}): "
+                    f"{response_body}"
+                )
+            payload = await response.json(content_type=None)
+    except (
+        ClientError,
+        asyncio.TimeoutError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+    ) as exc:
+        raise ProvisioningError(f"SillyTavern user creation failed: {exc}") from exc
+    created_handle = payload.get("handle") if isinstance(payload, dict) else None
+    if created_handle != handle:
+        raise ProvisioningError("SillyTavern returned an unexpected created handle")
+    log.info("Created managed SillyTavern account %r (admin=%s)", handle, is_admin)
     return handle
 
 
-# ─── Proxy ───────────────────────────────────────────────────────────────────
+async def st_sync_admin_role(
+    session: ClientSession,
+    csrf: str,
+    user: dict[str, Any],
+    desired_admin: bool,
+) -> None:
+    handle = user.get("handle")
+    if not isinstance(handle, str):
+        raise ProvisioningError("SillyTavern returned a user without a handle")
+    current_admin = bool(user.get("admin"))
+    if current_admin == desired_admin:
+        return
+    action = "promote" if desired_admin else "demote"
+    headers = {"Content-Type": "application/json", "x-csrf-token": csrf}
+    try:
+        async with session.post(
+            f"{ST_BACKEND}/api/users/{action}",
+            json={"handle": handle},
+            headers=headers,
+        ) as response:
+            if response.status not in {200, 204}:
+                body = await _safe_response_text(response)
+                raise ProvisioningError(
+                    f"SillyTavern {action} failed ({response.status}): {body}"
+                )
+    except (ClientError, asyncio.TimeoutError) as exc:
+        raise ProvisioningError(f"SillyTavern {action} failed: {exc}") from exc
+    log.info("Reconciled admin role for %r to %s", handle, desired_admin)
 
-# Headers that should NOT be forwarded as-is (we manipulate them)
+
+async def st_apply_default_api_config(uid: str, handle: str) -> None:
+    """Configure a managed user through SillyTavern's authenticated APIs."""
+    password = derive_user_password(uid)
+    timeout = ClientTimeout(total=20, sock_connect=5, sock_read=20)
+    async with ClientSession(
+        timeout=timeout,
+        cookie_jar=CookieJar(unsafe=True),
+    ) as session:
+        csrf = await st_get_csrf(session)
+        await st_login(session, csrf, handle, password)
+        csrf = await st_get_csrf(session)
+        headers = {"Content-Type": "application/json", "x-csrf-token": csrf}
+
+        try:
+            async with session.post(
+                f"{ST_BACKEND}/api/settings/get",
+                json={},
+                headers=headers,
+            ) as response:
+                if response.status != 200:
+                    body = await _safe_response_text(response)
+                    raise ProvisioningError(
+                        f"SillyTavern settings read failed ({response.status}): {body}"
+                    )
+                payload = await response.json(content_type=None)
+        except (
+            ClientError,
+            asyncio.TimeoutError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+        ) as exc:
+            raise ProvisioningError(f"SillyTavern settings read failed: {exc}") from exc
+
+        raw_settings = payload.get("settings") if isinstance(payload, dict) else None
+        try:
+            settings = (
+                json.loads(raw_settings)
+                if isinstance(raw_settings, str)
+                else raw_settings
+            )
+        except json.JSONDecodeError as exc:
+            raise ProvisioningError(
+                "SillyTavern returned invalid settings JSON"
+            ) from exc
+        if not isinstance(settings, dict):
+            raise ProvisioningError("SillyTavern returned invalid settings")
+
+        oai_settings = settings.get("oai_settings")
+        if not isinstance(oai_settings, dict):
+            oai_settings = {}
+            settings["oai_settings"] = oai_settings
+        oai_settings["chat_completion_source"] = "custom"
+        oai_settings["custom_url"] = API_URL_FOR_USERS
+        oai_settings["custom_model"] = DEFAULT_MODEL
+        oai_settings["openai_model"] = DEFAULT_MODEL
+        settings["main_api"] = "openai"
+
+        try:
+            async with session.post(
+                f"{ST_BACKEND}/api/settings/save",
+                json=settings,
+                headers=headers,
+            ) as response:
+                if response.status != 200:
+                    body = await _safe_response_text(response)
+                    raise ProvisioningError(
+                        f"SillyTavern settings write failed ({response.status}): {body}"
+                    )
+                result = await response.json(content_type=None)
+                if not isinstance(result, dict) or result.get("result") != "ok":
+                    raise ProvisioningError(
+                        "SillyTavern did not confirm the settings write"
+                    )
+            async with session.post(
+                f"{ST_BACKEND}/api/secrets/write",
+                json={
+                    "key": "api_key_custom",
+                    "value": API_PROXY_TOKEN,
+                    "label": "SSO sidecar relay",
+                },
+                headers=headers,
+            ) as response:
+                if response.status != 200:
+                    body = await _safe_response_text(response)
+                    raise ProvisioningError(
+                        f"SillyTavern secret write failed ({response.status}): {body}"
+                    )
+                result = await response.json(content_type=None)
+                if not isinstance(result, dict) or not isinstance(
+                    result.get("id"), str
+                ):
+                    raise ProvisioningError(
+                        "SillyTavern did not confirm the secret write"
+                    )
+        except (
+            ClientError,
+            asyncio.TimeoutError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+        ) as exc:
+            raise ProvisioningError(
+                f"SillyTavern default configuration failed: {exc}"
+            ) from exc
+    log.info("Applied default API configuration for %r", handle)
+
+
+async def ensure_user(
+    uid: str,
+    username: str,
+    display_name: str,
+    groups: str,
+) -> str:
+    """Resolve, safely link, or provision one Authentik identity."""
+    if not SAFE_UID_RE.fullmatch(uid):
+        raise IdentityConflict("the SSO UID has an invalid format")
+
+    desired_admin = groups_grant_admin(groups)
+    record = find_mapping(uid)
+    if record is not None and record.handle == ADMIN_HANDLE:
+        raise IdentityConflict("the provisioning administrator cannot be SSO-bound")
+    handle_from_username = slugify(username) if record is None else ""
+    if record is None and not handle_from_username:
+        raise IdentityConflict("the SSO username cannot form a valid handle")
+
+    async with st_admin_session() as (session, csrf):
+        users = await st_list_users(session, csrf)
+        users_by_handle = {
+            item.get("handle"): item
+            for item in users
+            if isinstance(item.get("handle"), str)
+        }
+
+        if record is not None:
+            handle = record.handle
+            user = users_by_handle.get(handle)
+            if user is None:
+                if not record.managed:
+                    raise IdentityConflict(
+                        "the mapped SillyTavern account no longer exists"
+                    )
+                if not AUTO_PROVISION:
+                    raise ProvisioningError("automatic provisioning is disabled")
+                await st_create_user(
+                    session,
+                    csrf,
+                    handle,
+                    display_name or username,
+                    derive_user_password(uid),
+                    desired_admin,
+                )
+                user = {"handle": handle, "enabled": True, "admin": desired_admin}
+                record = mark_mapping_provisioned(
+                    uid,
+                    reset_api_config=True,
+                )
+            else:
+                if not bool(user.get("enabled", True)):
+                    raise IdentityConflict("the mapped SillyTavern account is disabled")
+                if record.managed:
+                    await st_verify_user_credentials(
+                        handle,
+                        derive_user_password(uid),
+                    )
+                    if not record.provisioned:
+                        record = mark_mapping_provisioned(
+                            uid,
+                            reset_api_config=True,
+                        )
+            await st_sync_admin_role(session, csrf, user, desired_admin)
+        else:
+            handle = handle_from_username
+            if handle == ADMIN_HANDLE:
+                raise IdentityConflict(
+                    "the SSO username collides with the administrator"
+                )
+
+            bound_uid = find_uid_by_handle(handle)
+            if bound_uid is not None and bound_uid != uid:
+                raise IdentityConflict(
+                    "the requested handle belongs to another SSO identity"
+                )
+
+            user = users_by_handle.get(handle)
+            if user is not None:
+                if not bool(user.get("enabled", True)):
+                    raise IdentityConflict(
+                        "the matching SillyTavern account is disabled"
+                    )
+                if bound_uid != uid and not ALLOW_USERNAME_LINKING:
+                    raise IdentityConflict(
+                        "the matching account is unbound and username linking is disabled"
+                    )
+                record = save_mapping(
+                    uid,
+                    handle,
+                    provisioned=True,
+                    managed=False,
+                )
+                await st_sync_admin_role(session, csrf, user, desired_admin)
+                log.info("Linked existing SillyTavern account %r", handle)
+                return handle
+
+            if not AUTO_PROVISION:
+                raise ProvisioningError("automatic provisioning is disabled")
+
+            # Persist a pending managed mapping before the network mutation. If
+            # the create response is lost, a retry can verify ownership using
+            # the deterministic high-entropy account password.
+            record = save_mapping(
+                uid,
+                handle,
+                provisioned=False,
+                managed=True,
+            )
+            await st_create_user(
+                session,
+                csrf,
+                handle,
+                display_name or username,
+                derive_user_password(uid),
+                desired_admin,
+            )
+            record = mark_mapping_provisioned(
+                uid,
+                reset_api_config=True,
+            )
+
+    if record.managed and API_PROXY_ENABLED:
+        desired_config_digest = current_api_config_digest()
+        if record.api_config_digest != desired_config_digest:
+            await st_apply_default_api_config(uid, handle)
+            mark_mapping_api_configured(uid, desired_config_digest)
+
+    log.info("Resolved SSO identity to SillyTavern handle %r", handle)
+    return handle
+
+
 _HOP_BY_HOP = {
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade",
-    "host", "content-length",  # aiohttp recalculates
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "content-length",
 }
 
-# Cache: uid → mapped handle (avoids scanning _storage on every request)
-_UID_CACHE: dict[str, str] = {}
-# Tracks uids we've already attempted provisioning for (even if failed)
-_UID_TRIED: set[str] = set()
-# Protect the first-login provisioning path from concurrent static/page requests
-_PROVISION_LOCK = asyncio.Lock()
+_AUTO_DECOMPRESSED_ENCODINGS = frozenset({"gzip", "deflate", "br", "zstd"})
+_DECODED_BODY_INTEGRITY_HEADERS = frozenset(
+    {"content-md5", "digest", "content-digest", "repr-digest"}
+)
 
-# Static file extensions — skip provisioning for these
-_STATIC_EXTS = {".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
-                 ".woff", ".woff2", ".ttf", ".eot", ".map", ".webp", ".webm",
-                 ".mp3", ".mp4", ".ogg", ".wav", ".json", ".xml", ".txt",
-                 ".wasm", ".worker.js"}
+_AUTHENTIK_HEADERS = (
+    "X-Authentik-Uid",
+    "X-Authentik-Email",
+    "X-Authentik-Name",
+    "X-Authentik-Groups",
+    "X-Authentik-Entitlements",
+    "X-Authentik-Meta-Outpost",
+    "X-Authentik-Meta-Provider",
+    "X-Authentik-Meta-App",
+    "X-Authentik-Meta-Version",
+)
 
-def is_static_request(path: str) -> bool:
-    """Check if this is a static resource request (skip SSO logic)."""
-    for ext in _STATIC_EXTS:
-        if path.endswith(ext):
-            return True
-    # API calls that don't need SSO header rewriting
-    if path.startswith("/api/"):
-        return True
-    if path.startswith("/outpost.goauthentik.io"):
-        return True
-    return False
+_BLOCKED_BROWSER_ACCOUNT_PATHS = {
+    "/api/users/login",
+    "/api/users/list",
+    "/api/users/recover-step1",
+    "/api/users/recover-step2",
+    "/api/users/change-password",
+    "/api/users/get",
+    "/api/users/disable",
+    "/api/users/enable",
+    "/api/users/promote",
+    "/api/users/demote",
+    "/api/users/create",
+    "/api/users/delete",
+    "/api/users/slugify",
+}
 
-async def handle_api_proxy(request: web.Request, path: str) -> web.StreamResponse:
-    """
-    Proxy /v1/* to the upstream API channel, injecting the real API key
-    server-side and enforcing the allowed-models whitelist. Users never see
-    the real key, and models other than the whitelist are rejected.
-    """
-    # Model whitelist enforcement (only for requests carrying a JSON body)
-    body = None
-    if request.method in ("POST", "PUT", "PATCH"):
-        try:
-            body = await request.read()
-            payload = json.loads(body) if body else {}
-            model = payload.get("model")
-            if model and model not in ALLOWED_MODELS:
-                log.warning(f"Blocked model '{model}' (allowed: {sorted(ALLOWED_MODELS)})")
-                return web.json_response(
-                    {"error": {"message": f"Model '{model}' is not allowed. Allowed models: {', '.join(sorted(ALLOWED_MODELS))}"}},
-                    status=400,
-                )
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            body = None  # non-JSON body — pass through untouched below
+_API_ROUTE_METHODS = {
+    "/v1/models": frozenset({"GET"}),
+    "/v1/chat/completions": frozenset({"POST"}),
+    "/v1/completions": frozenset({"POST"}),
+}
 
-    # Build target URL: API_BASE_URL already includes /v1
-    rest = path[len("/v1"):] if path.startswith("/v1") else path
-    query = request.rel_url.query_string
-    target_url = f"{API_BASE_URL}{rest}" + (f"?{query}" if query else "")
+_API_SUFFIXES = {
+    "/v1/models": "/models",
+    "/v1/chat/completions": "/chat/completions",
+    "/v1/completions": "/completions",
+}
 
-    # Headers: strip hop-by-hop, drop any client-supplied auth, inject real key
-    out_headers = {}
-    for key, val in request.headers.items():
-        if key.lower() in _HOP_BY_HOP or key.lower() in ("authorization", "x-api-key"):
+
+def is_trusted_proxy(request: web.Request) -> bool:
+    remote = request.remote
+    if not remote:
+        return False
+    try:
+        address = ipaddress.ip_address(remote.split("%", 1)[0])
+    except ValueError:
+        return False
+    candidates = [address]
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        candidates.append(address.ipv4_mapped)
+    return any(
+        candidate.version == network.version and candidate in network
+        for candidate in candidates
+        for network in TRUSTED_PROXY_NETWORKS
+    )
+
+
+def _bearer_token(request: web.Request) -> str | None:
+    authorization = request.headers.get("Authorization", "")
+    scheme, separator, token = authorization.partition(" ")
+    if not separator or scheme.lower() != "bearer" or not token:
+        return None
+    return token.strip()
+
+
+def _api_auth_valid(request: web.Request) -> bool:
+    provided = _bearer_token(request)
+    return bool(
+        provided
+        and API_PROXY_TOKEN
+        and secrets.compare_digest(provided, API_PROXY_TOKEN)
+    )
+
+
+def _reject_nonstandard_json(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+async def _read_limited_body(request: web.Request, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.content.iter_chunked(64 * 1024):
+        total += len(chunk)
+        if total > limit:
+            raise web.HTTPRequestEntityTooLarge(max_size=limit, actual_size=total)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _stream_limited_body(
+    request: web.Request,
+    limit: int,
+    state: BodyStreamState,
+) -> AsyncIterator[bytes]:
+    """Stream an automatically decoded request body while enforcing its limit."""
+    async for chunk in request.content.iter_chunked(64 * 1024):
+        state.actual_size += len(chunk)
+        if state.actual_size > limit:
+            state.exceeded_limit = True
+            raise ValueError("request body exceeds SSO_MAX_BODY_BYTES")
+        yield chunk
+
+
+def _connection_header_names(headers: Any) -> set[str]:
+    """Return hop-by-hop field names nominated by Connection headers."""
+    names: set[str] = set()
+    for value in headers.getall("Connection", ()):
+        names.update(
+            token.strip().lower() for token in value.split(",") if token.strip()
+        )
+    return names
+
+
+def _request_body_was_auto_decompressed(request: web.Request) -> bool:
+    content_encoding = request.headers.get("Content-Encoding", "").strip().lower()
+    return content_encoding in _AUTO_DECOMPRESSED_ENCODINGS
+
+
+def _response_sets_st_session_cookie(headers: Any) -> bool:
+    """Recognize SillyTavern's hostname-scoped cookie-session cookies."""
+    return any(
+        ST_SESSION_COOKIE_RE.fullmatch(value.partition("=")[0].strip())
+        for value in headers.getall("Set-Cookie", ())
+    )
+
+
+def _normalized_route_path(path: str) -> str:
+    """Normalize decoded paths like Express's case-insensitive route matching."""
+    segments: list[str] = []
+    for segment in path.split("/"):
+        if not segment or segment == ".":
             continue
-        out_headers[key] = val
-    out_headers["Authorization"] = f"Bearer {API_KEY}"
+        if segment == "..":
+            if segments:
+                segments.pop()
+            continue
+        segments.append(segment)
+    return ("/" + "/".join(segments)).lower()
 
+
+async def _copy_upstream_response(
+    request: web.Request,
+    upstream: Any,
+    *,
+    strip_cookies: bool,
+    identity_binding: str | None = None,
+    identity_binding_confirmed: bool = False,
+) -> web.StreamResponse:
+    response = web.StreamResponse(status=upstream.status, reason=upstream.reason)
+    blocked_headers = _HOP_BY_HOP | _connection_header_names(upstream.headers)
+    for key, value in upstream.headers.items():
+        lower = key.lower()
+        if lower in blocked_headers or (strip_cookies and lower == "set-cookie"):
+            continue
+        response.headers.add(key, value)
+    if identity_binding is not None and (
+        identity_binding_confirmed or _response_sets_st_session_cookie(upstream.headers)
+    ):
+        response.set_cookie(
+            SSO_BINDING_COOKIE_NAME,
+            identity_binding,
+            max_age=SSO_BINDING_COOKIE_MAX_AGE,
+            httponly=True,
+            secure=SSO_BINDING_COOKIE_SECURE,
+            samesite="Lax",
+            path="/",
+        )
+    await response.prepare(request)
+    async for chunk in upstream.content.iter_any():
+        await response.write(chunk)
+    await response.write_eof()
+    return response
+
+
+async def handle_api_proxy(request: web.Request) -> web.StreamResponse:
+    if not API_PROXY_ENABLED:
+        raise web.HTTPNotFound()
+    if not _api_auth_valid(request):
+        return web.json_response(
+            {"error": {"message": "API relay authentication failed"}},
+            status=401,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    path = request.path
+    allowed_methods = _API_ROUTE_METHODS.get(path)
+    if allowed_methods is None:
+        raise web.HTTPNotFound()
+    if request.method not in allowed_methods:
+        return web.json_response(
+            {"error": {"message": "Method not allowed"}},
+            status=405,
+            headers={"Allow": ", ".join(sorted(allowed_methods))},
+        )
+    if request.query_string:
+        return web.json_response(
+            {"error": {"message": "Query parameters are not supported"}},
+            status=400,
+        )
+
+    if path == "/v1/models":
+        return web.json_response(
+            {
+                "object": "list",
+                "data": [
+                    {
+                        "id": model,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": "sso-sidecar",
+                    }
+                    for model in ALLOWED_MODELS
+                ],
+            }
+        )
+
+    body = b""
+    if request.method == "POST":
+        if request.content_type != "application/json":
+            return web.json_response(
+                {"error": {"message": "Content-Type must be application/json"}},
+                status=415,
+            )
+        if (
+            request.content_length is not None
+            and not _request_body_was_auto_decompressed(request)
+            and request.content_length > API_MAX_BODY_BYTES
+        ):
+            raise web.HTTPRequestEntityTooLarge(
+                max_size=API_MAX_BODY_BYTES,
+                actual_size=request.content_length,
+            )
+        body = await _read_limited_body(request, API_MAX_BODY_BYTES)
+        try:
+            payload = json.loads(body, parse_constant=_reject_nonstandard_json)
+        except (
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            ValueError,
+            RecursionError,
+        ):
+            return web.json_response(
+                {"error": {"message": "Request body must be valid JSON"}},
+                status=400,
+            )
+        if not isinstance(payload, dict):
+            return web.json_response(
+                {"error": {"message": "Request JSON must be an object"}},
+                status=400,
+            )
+        model = payload.get("model")
+        if not isinstance(model, str) or not model:
+            return web.json_response(
+                {"error": {"message": "A model is required"}},
+                status=400,
+            )
+        if model not in ALLOWED_MODEL_SET:
+            log.warning("Blocked disallowed model %r", model)
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "The requested model is not allowed",
+                        "allowed_models": list(ALLOWED_MODELS),
+                    }
+                },
+                status=400,
+            )
+        try:
+            body = json.dumps(
+                payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (ValueError, RecursionError):
+            return web.json_response(
+                {"error": {"message": "Request body must be valid JSON"}},
+                status=400,
+            )
+
+    outbound_headers = CIMultiDict()
+    for name in ("Accept", "Content-Type", "User-Agent", "X-Request-Id"):
+        value = request.headers.get(name)
+        if value:
+            outbound_headers[name] = value
+    if request.method == "POST":
+        outbound_headers["Content-Type"] = "application/json"
+    outbound_headers["Authorization"] = f"Bearer {API_KEY}"
+
+    target_url = f"{API_BASE_URL}{_API_SUFFIXES[path]}"
     timeout = ClientTimeout(total=300, sock_connect=15, sock_read=300)
-    async with ClientSession(timeout=timeout, auto_decompress=False, cookie_jar=None) as fwd_session:
-        async with fwd_session.request(
-            method=request.method,
-            url=target_url,
-            headers=out_headers,
-            data=body,
-            allow_redirects=False,
-        ) as upstream:
-            resp = web.StreamResponse(status=upstream.status, reason=upstream.reason)
-            for key, val in upstream.headers.items():
-                if key.lower() in _HOP_BY_HOP:
-                    continue
-                resp.headers.add(key, val)
-            await resp.prepare(request)
-            async for chunk in upstream.content.iter_any():
-                await resp.write(chunk)
-            await resp.write_eof()
-            return resp
+    try:
+        async with (
+            ClientSession(
+                timeout=timeout,
+                auto_decompress=False,
+                cookie_jar=DummyCookieJar(),
+            ) as session,
+            session.request(
+                method=request.method,
+                url=target_url,
+                headers=outbound_headers,
+                data=body or None,
+                allow_redirects=False,
+            ) as upstream,
+        ):
+            return await _copy_upstream_response(
+                request,
+                upstream,
+                strip_cookies=True,
+            )
+    except asyncio.TimeoutError:
+        return web.json_response(
+            {"error": {"message": "Upstream API timed out"}}, status=504
+        )
+    except ClientError as exc:
+        log.error("Upstream API request failed: %s", exc)
+        return web.json_response(
+            {"error": {"message": "Upstream API is unavailable"}}, status=502
+        )
+
+
+def _backend_cookie_header(request: web.Request) -> str:
+    cookies = SimpleCookie()
+    for name, value in request.cookies.items():
+        if name != SSO_BINDING_COOKIE_NAME:
+            cookies[name] = value
+    return cookies.output(header="", sep=";").strip()
+
+
+def _build_st_headers(
+    request: web.Request,
+    mapped_handle: str,
+    *,
+    forward_cookies: bool,
+) -> CIMultiDict[str]:
+    headers: CIMultiDict[str] = CIMultiDict()
+    blocked_headers = _HOP_BY_HOP | _connection_header_names(request.headers)
+    # aiohttp automatically decodes recognized request encodings before the
+    # handler sees the body. Do not label the decoded stream as compressed.
+    if _request_body_was_auto_decompressed(request):
+        blocked_headers.update({"content-encoding"} | _DECODED_BODY_INTEGRITY_HEADERS)
+    for key, value in request.headers.items():
+        lower = key.lower()
+        if (
+            lower in blocked_headers
+            or lower in {"authorization", "cookie"}
+            or lower.startswith("x-authentik-")
+        ):
+            continue
+        headers.add(key, value)
+    if forward_cookies:
+        cookie_header = _backend_cookie_header(request)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+    for name in _AUTHENTIK_HEADERS:
+        value = request.headers.get(name)
+        if value:
+            headers[name] = value
+    headers["X-Authentik-Username"] = mapped_handle
+    return headers
+
+
+async def _resolve_request_identity(request: web.Request) -> str:
+    uid = request.headers.get("X-Authentik-Uid", "").strip()
+    username = request.headers.get("X-Authentik-Username", "").strip()
+    if not uid or not username:
+        raise web.HTTPUnauthorized(
+            text=json.dumps({"error": "Missing Authentik identity headers"}),
+            content_type="application/json",
+        )
+
+    groups = request.headers.get("X-Authentik-Groups", "")
+    expected_admin = groups_grant_admin(groups)
+    now = time.monotonic()
+    cache: dict[str, CachedIdentity] = request.app[UID_CACHE_KEY]
+    cached = cache.get(uid)
+    if (
+        cached is not None
+        and cached.expires_at > now
+        and cached.expected_admin == expected_admin
+    ):
+        return cached.handle
+
+    lock: asyncio.Lock = request.app[PROVISION_LOCK_KEY]
+    async with lock:
+        now = time.monotonic()
+        for cached_uid, cached_identity in tuple(cache.items()):
+            if cached_identity.expires_at <= now:
+                cache.pop(cached_uid, None)
+        cached = cache.get(uid)
+        if (
+            cached is not None
+            and cached.expires_at > now
+            and cached.expected_admin == expected_admin
+        ):
+            return cached.handle
+        try:
+            handle = await ensure_user(
+                uid,
+                username,
+                request.headers.get("X-Authentik-Name", "").strip(),
+                groups,
+            )
+        except IdentityConflict as exc:
+            log.warning("Rejected SSO identity conflict: %s", exc)
+            raise web.HTTPConflict(
+                text=json.dumps(
+                    {
+                        "error": "SSO identity conflicts with an existing account; "
+                        "contact an administrator"
+                    }
+                ),
+                content_type="application/json",
+            ) from exc
+        except Exception as exc:
+            log.exception("SSO provisioning failed")
+            raise web.HTTPServiceUnavailable(
+                text=json.dumps(
+                    {"error": "SSO account provisioning failed; retry later"}
+                ),
+                content_type="application/json",
+                headers={"Retry-After": "5"},
+            ) from exc
+        cache[uid] = CachedIdentity(
+            handle=handle,
+            expected_admin=expected_admin,
+            expires_at=now + UID_CACHE_TTL,
+        )
+        return handle
 
 
 async def handle_request(request: web.Request) -> web.StreamResponse:
-    """Transparent proxy: inject mapped username, forward everything else."""
-    path = request.rel_url.path
-
-    # /v1/* goes straight to the upstream API channel (no SSO mapping needed)
+    path = request.path
     if path == "/v1" or path.startswith("/v1/"):
-        return await handle_api_proxy(request, path)
+        return await handle_api_proxy(request)
 
-    # Build outgoing headers
-    out_headers = {}
-    for key, val in request.headers.items():
-        if key.lower() in _HOP_BY_HOP:
-            continue
-        if key in out_headers:
-            # Multi-valued header — comma-join
-            out_headers[key] += ", " + val
-        else:
-            out_headers[key] = val
+    if not is_trusted_proxy(request):
+        return web.json_response(
+            {"error": "Request did not originate from a trusted Authentik proxy"},
+            status=403,
+        )
 
-    # SSO mapping: only for page loads (not static/API), and only once per uid
-    uid = request.headers.get("X-Authentik-Uid", "")
-    username = request.headers.get("X-Authentik-Username", "")
+    uid = request.headers.get("X-Authentik-Uid", "").strip()
+    username = request.headers.get("X-Authentik-Username", "").strip()
+    if not uid or not username:
+        return web.json_response(
+            {"error": "Missing Authentik identity headers"}, status=401
+        )
 
-    if uid and username and not is_static_request(path):
-        if uid in _UID_CACHE:
-            out_headers["X-Authentik-Username"] = _UID_CACHE[uid]
-            log.debug(f"Cache hit: uid={uid} → handle={_UID_CACHE[uid]}")
-        elif uid not in _UID_TRIED:
-            async with _PROVISION_LOCK:
-                # Another request may have completed provisioning while we waited.
-                if uid in _UID_CACHE:
-                    out_headers["X-Authentik-Username"] = _UID_CACHE[uid]
-                elif uid not in _UID_TRIED:
-                    _UID_TRIED.add(uid)
-                    display_name = request.headers.get("X-Authentik-Name", "")
-                    groups = request.headers.get("X-Authentik-Groups", "")
-                    try:
-                        mapped_handle = await ensure_user(uid, username, display_name, groups)
-                        if mapped_handle:
-                            _UID_CACHE[uid] = mapped_handle
-                            out_headers["X-Authentik-Username"] = mapped_handle
-                            log.info(f"Provisioned: uid={uid} username={username} → handle={mapped_handle}")
-                        else:
-                            log.warning(f"Provisioning failed for uid={uid} username={username}")
-                    except Exception as e:
-                        log.error(f"Provisioning exception for uid={uid}: {e}")
-        else:
-            # Already tried and failed — pass through with original username
-            log.debug(f"Already tried uid={uid}, passing through")
-    elif uid and username and is_static_request(path):
-        # For static requests, still rewrite if we have a cached mapping
-        if uid in _UID_CACHE:
-            out_headers["X-Authentik-Username"] = _UID_CACHE[uid]
+    # The sidecar calls these directly on the isolated backend. They are never
+    # exposed through the browser-facing SSO proxy.
+    account_path = _normalized_route_path(path)
+    if account_path in _BLOCKED_BROWSER_ACCOUNT_PATHS:
+        raise web.HTTPNotFound()
 
-    # Read body
-    body = await request.read()
-
-    # Forward to ST
-    target_url = f"{ST_BACKEND}{request.rel_url.path_qs}"
+    mapped_handle = await _resolve_request_identity(request)
+    forward_cookies = request_has_valid_identity_binding(request, uid)
+    if request.headers.get("Cookie") and not forward_cookies:
+        log.info("Discarded a stale or unbound SillyTavern browser session")
+    headers = _build_st_headers(
+        request,
+        mapped_handle,
+        forward_cookies=forward_cookies,
+    )
+    if (
+        request.content_length is not None
+        and not _request_body_was_auto_decompressed(request)
+        and request.content_length > SSO_MAX_BODY_BYTES
+    ):
+        raise web.HTTPRequestEntityTooLarge(
+            max_size=SSO_MAX_BODY_BYTES,
+            actual_size=request.content_length,
+        )
+    body_state = BodyStreamState()
+    body = (
+        _stream_limited_body(request, SSO_MAX_BODY_BYTES, body_state)
+        if request.can_read_body
+        else None
+    )
+    target_url = f"{ST_BACKEND}{request.raw_path}"
     timeout = ClientTimeout(total=120, sock_connect=10, sock_read=120)
-
-    # Use a session with cookie_jar=None to avoid swallowing Set-Cookie headers
-    # from upstream. We pass them through manually in the response.
-    async with ClientSession(timeout=timeout, auto_decompress=False, cookie_jar=None) as fwd_session:
-        async with fwd_session.request(
-            method=request.method,
-            url=target_url,
-            headers=out_headers,
-            data=body,
-            allow_redirects=False,
-        ) as upstream:
-            # Build response
-            resp = web.StreamResponse(
-                status=upstream.status,
-                reason=upstream.reason,
+    try:
+        async with (
+            ClientSession(
+                timeout=timeout,
+                auto_decompress=False,
+                cookie_jar=DummyCookieJar(),
+            ) as session,
+            session.request(
+                method=request.method,
+                url=target_url,
+                headers=headers,
+                data=body or None,
+                allow_redirects=False,
+            ) as upstream,
+        ):
+            return await _copy_upstream_response(
+                request,
+                upstream,
+                strip_cookies=False,
+                identity_binding=identity_binding_token(uid),
+                identity_binding_confirmed=forward_cookies,
             )
-            # Copy headers (skip hop-by-hop) — use .add() for multi-valued headers
-            # like Set-Cookie (using .[]= overwrites previous values)
-            for key, val in upstream.headers.items():
-                if key.lower() in _HOP_BY_HOP:
-                    continue
-                resp.headers.add(key, val)
-
-            await resp.prepare(request)
-            async for chunk in upstream.content.iter_any():
-                await resp.write(chunk)
-            await resp.write_eof()
-            return resp
+    except asyncio.TimeoutError:
+        return web.json_response({"error": "SillyTavern timed out"}, status=504)
+    except ClientError as exc:
+        if body_state.exceeded_limit:
+            raise web.HTTPRequestEntityTooLarge(
+                max_size=SSO_MAX_BODY_BYTES,
+                actual_size=body_state.actual_size,
+            ) from exc
+        log.error("SillyTavern proxy request failed: %s", exc)
+        return web.json_response({"error": "SillyTavern is unavailable"}, status=502)
 
 
-async def health(request: web.Request) -> web.Response:
-    return web.json_response({
-        "status": "ok",
-        "st_backend": ST_BACKEND,
-    })
+async def health(_request: web.Request) -> web.Response:
+    return web.json_response(
+        {
+            "status": "ok",
+            "version": VERSION,
+            "api_proxy_enabled": API_PROXY_ENABLED,
+        }
+    )
 
 
-def main():
-    app = web.Application(client_max_size=100 * 1024 * 1024)  # 100MB
-    app.router.add_get("/_sso_health", health)
-    app.router.add_route("*", "/{tail:.*}", handle_request)
+def _valid_http_url(value: str) -> bool:
+    if value != value.strip() or any(
+        character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F
+        for character in value
+    ):
+        return False
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme in {"http", "https"}
+        and bool(hostname)
+        and (port is None or 1 <= port <= 65535)
+        and not (parsed.username or parsed.password or parsed.query or parsed.fragment)
+    )
 
-    log.info(f"SSO sidecar starting on :{LISTEN_PORT} → {ST_BACKEND}")
-    log.info(f"Admin handle: {ADMIN_HANDLE}, Admin groups: {ADMIN_GROUPS}")
-    web.run_app(app, host="0.0.0.0", port=LISTEN_PORT, access_log=None)
+
+def validate_configuration() -> None:
+    errors: list[str] = []
+    if not _valid_http_url(ST_BACKEND):
+        errors.append(
+            "ST_BACKEND must be an http(s) URL without credentials, query, or fragment"
+        )
+    if not 1 <= LISTEN_PORT <= 65535:
+        errors.append("LISTEN_PORT must be between 1 and 65535")
+    if not ADMIN_HANDLE or slugify(ADMIN_HANDLE) != ADMIN_HANDLE:
+        errors.append("ADMIN_HANDLE must already be a valid SillyTavern handle")
+    if len(ADMIN_PASSWORD) < 20:
+        errors.append("ADMIN_PASSWORD must be set to at least 20 characters")
+    if len(USER_PASSWORD_SECRET) < 32:
+        errors.append("USER_PASSWORD_SECRET must be set to at least 32 characters")
+    if ADMIN_PASSWORD and ADMIN_PASSWORD == USER_PASSWORD_SECRET:
+        errors.append("ADMIN_PASSWORD and USER_PASSWORD_SECRET must be independent")
+    if TRUSTED_PROXY_ERROR:
+        errors.append(f"TRUSTED_PROXY_CIDRS is invalid: {TRUSTED_PROXY_ERROR}")
+    elif not TRUSTED_PROXY_NETWORKS:
+        errors.append(
+            "TRUSTED_PROXY_CIDRS must list the Authentik outpost source CIDR(s)"
+        )
+    if not os.path.isabs(STATE_FILE):
+        errors.append("STATE_FILE must be an absolute path")
+
+    if API_PROXY_ENABLED:
+        if not _valid_http_url(API_BASE_URL):
+            errors.append(
+                "API_BASE_URL must be an http(s) URL without credentials, query, or fragment"
+            )
+        elif urlsplit(API_BASE_URL).hostname == "api.example.com":
+            errors.append("API_BASE_URL must not use the example placeholder")
+        if not API_KEY:
+            errors.append("API_KEY must be set when API_PROXY_ENABLED=true")
+        if API_KEY and API_KEY in {ADMIN_PASSWORD, USER_PASSWORD_SECRET}:
+            errors.append("API_KEY must be independent from account secrets")
+        if len(API_PROXY_TOKEN) < 32:
+            errors.append("API_PROXY_TOKEN must be set to at least 32 characters")
+        if API_KEY and API_PROXY_TOKEN == API_KEY:
+            errors.append("API_PROXY_TOKEN must not equal the upstream API_KEY")
+        if API_PROXY_TOKEN and API_PROXY_TOKEN in {
+            ADMIN_PASSWORD,
+            USER_PASSWORD_SECRET,
+        }:
+            errors.append("API_PROXY_TOKEN must be independent from account secrets")
+        if not ALLOWED_MODELS:
+            errors.append("ALLOWED_MODELS must contain at least one model")
+        if DEFAULT_MODEL not in ALLOWED_MODEL_SET:
+            errors.append("DEFAULT_MODEL must be present in ALLOWED_MODELS")
+        if not _valid_http_url(API_URL_FOR_USERS):
+            errors.append(
+                "ST_API_BASE must be an http(s) URL without credentials, query, or fragment"
+            )
+        if API_MAX_BODY_BYTES <= 0:
+            errors.append("API_MAX_BODY_BYTES must be positive")
+    if UID_CACHE_TTL < 0:
+        errors.append("UID_CACHE_TTL cannot be negative")
+    if SSO_MAX_BODY_BYTES <= 0:
+        errors.append("SSO_MAX_BODY_BYTES must be positive")
+    if errors:
+        raise ValueError("Invalid configuration:\n- " + "\n- ".join(errors))
+
+
+def create_app(*, validate: bool = True) -> web.Application:
+    if validate:
+        validate_configuration()
+    relay_limit = API_MAX_BODY_BYTES if API_PROXY_ENABLED else 0
+    application = web.Application(client_max_size=max(SSO_MAX_BODY_BYTES, relay_limit))
+    application[UID_CACHE_KEY] = {}
+    application[PROVISION_LOCK_KEY] = asyncio.Lock()
+    application.router.add_get("/_sso_health", health)
+    application.router.add_route("*", "/{tail:.*}", handle_request)
+    return application
+
+
+def main() -> None:
+    try:
+        application = create_app()
+    except ValueError as exc:
+        log.critical("%s", exc)
+        raise SystemExit(2) from exc
+    log.info("SSO sidecar %s starting on port %s", VERSION, LISTEN_PORT)
+    log.info("Trusted proxy CIDRs: %s", TRUSTED_PROXY_CIDRS)
+    log.info("Admin groups: %s", ", ".join(sorted(ADMIN_GROUPS)))
+    web.run_app(
+        application,
+        host="0.0.0.0",
+        port=LISTEN_PORT,
+        access_log=None,
+    )
 
 
 if __name__ == "__main__":
