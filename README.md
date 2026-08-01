@@ -13,12 +13,21 @@
 
 Sidecar 将浏览器流量和 SillyTavern 服务端的 LLM 流量视为两条独立的信任路径：
 
-```text
-Browser -> Authentik outpost -> sidecar /... -> SillyTavern
-                                  ^
-SillyTavern server ---------------+-- /v1 -> upstream LLM API
-                                      relay token   real API key
+```mermaid
+flowchart LR
+    subgraph SC["sso-sidecar"]
+        P["/...<br/>SSO 反向代理"]
+        R["/v1<br/>LLM 中继"]
+    end
+
+    B["浏览器"] -->|"Authentik 会话"| O["Authentik outpost"]
+    O -->|"X-Authentik-Uid<br/>X-Authentik-Username"| P
+    P -->|"X-Authentik-Username: handle"| ST["SillyTavern"]
+    ST -.->|"api_key_custom = API_PROXY_TOKEN"| R
+    R -->|"真实 API_KEY"| U["上游 LLM API"]
 ```
+
+实线是浏览器发起的 SSO 路径，虚线是 SillyTavern 服务端发起的中继调用。
 
 - 普通 SillyTavern 请求只接受来自 `TRUSTED_PROXY_CIDRS` 所列地址的连接，
   并且必须同时包含 `X-Authentik-Uid` 和 `X-Authentik-Username`。
@@ -320,10 +329,9 @@ Docker、用户命名空间和 Docker Desktop 可能采用不同方式转换所�
    不要运行 `docker compose down --volumes`。
 
 4. 对照[必需的 SillyTavern 配置](#sillytavern-必需配置)和当前环境变量表检查
-   部署。从 [`cf99d6f`](https://github.com/YatsukiRenka/sso-sidecar/commit/cf99d6f26257d759ed4d03d627ebad02478e9921)
-   之前的版本升级时，请确保已设置 `allowKeysExposure: false` 和
-   `sso.autheliaAuth: false`。现在，整数、布尔值、日志级别、URL 或密钥文件配置
-   无效时会在启动阶段清晰地失败，不再被隐式接受。
+   部署。从早于 v0.3.0 的版本升级时，请确保已设置 `allowKeysExposure: false`
+   和 `sso.autheliaAuth: false`。现在，整数、布尔值、日志级别、URL 或密钥文件
+   配置无效时会在启动阶段清晰地失败，不再被隐式接受。
 
 ### 重建并替换 Sidecar
 
@@ -343,8 +351,7 @@ SillyTavern，再测试 SSO。单独运行 `docker compose restart` 不会应用
 镜像或环境变量，因此上面的流程使用 `up`。
 
 确认服务健康后，依次测试普通用户 SSO 登录、适用时的管理员组用户登录以及已
-配置的 LLM 中继。`cf99d6f` 引入的更新没有改变映射状态格式，无需手工迁移
-状态。
+配置的 LLM 中继。v0.3.0 没有改变映射状态格式，无需手工迁移状态。
 
 ### 回滚
 

@@ -17,12 +17,22 @@ service-authenticated relay for an OpenAI-compatible LLM API.
 The sidecar treats browser traffic and SillyTavern's server-side LLM traffic
 as two separate trust paths:
 
-```text
-Browser -> Authentik outpost -> sidecar /... -> SillyTavern
-                                  ^
-SillyTavern server ---------------+-- /v1 -> upstream LLM API
-                                      relay token   real API key
+```mermaid
+flowchart LR
+    subgraph SC["sso-sidecar"]
+        P["/...<br/>SSO reverse proxy"]
+        R["/v1<br/>LLM relay"]
+    end
+
+    B["Browser"] -->|"Authentik session"| O["Authentik outpost"]
+    O -->|"X-Authentik-Uid<br/>X-Authentik-Username"| P
+    P -->|"X-Authentik-Username: handle"| ST["SillyTavern"]
+    ST -.->|"api_key_custom = API_PROXY_TOKEN"| R
+    R -->|"real API_KEY"| U["upstream LLM API"]
 ```
+
+The solid path is browser-initiated SSO traffic; the dotted edge is the relay
+call that SillyTavern makes server-side.
 
 - Normal SillyTavern requests are accepted only from an address in
   `TRUSTED_PROXY_CIDRS` and must contain both `X-Authentik-Uid` and
@@ -350,11 +360,11 @@ service name if your deployment differs.
    --volumes` as part of an update.
 
 4. Compare the deployment with [Required SillyTavern configuration](#required-sillytavern-configuration)
-   and the current environment-variable tables. When upgrading from a revision
-   before [`cf99d6f`](https://github.com/YatsukiRenka/sso-sidecar/commit/cf99d6f26257d759ed4d03d627ebad02478e9921), ensure that
-   `allowKeysExposure: false` and `sso.autheliaAuth: false` are present. Invalid
-   integer, boolean, log-level, URL, or secret-file settings now fail cleanly at
-   startup instead of being accepted implicitly.
+   and the current environment-variable tables. When upgrading from a release
+   before v0.3.0, ensure that `allowKeysExposure: false` and
+   `sso.autheliaAuth: false` are present. Invalid integer, boolean, log-level,
+   URL, or secret-file settings now fail cleanly at startup instead of being
+   accepted implicitly.
 
 ### Rebuild and replace the sidecar
 
@@ -375,9 +385,9 @@ using that deployment's normal procedure before testing SSO. A plain
 configuration, which is why the commands above use `up`.
 
 Confirm that the service is healthy, then test an ordinary SSO login, an
-administrator-group login if applicable, and the configured LLM relay. The
-update introduced in `cf99d6f` does not change the mapping-state format, so no
-manual state migration is required.
+administrator-group login if applicable, and the configured LLM relay. v0.3.0
+does not change the mapping-state format, so no manual state migration is
+required.
 
 ### Rollback
 
