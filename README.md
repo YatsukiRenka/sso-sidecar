@@ -1,66 +1,60 @@
 # SillyTavern SSO Sidecar
 
-Transparent reverse proxy that bridges Authentik SSO into SillyTavern's native
-username-based SSO.
+Transparent reverse proxy that sits between an Authentik proxy outpost and
+SillyTavern. It maps stable Authentik user UUIDs to SillyTavern accounts,
+auto-provisions new users on first login, and can proxy an upstream LLM API
+channel (`/v1/*`) with the real API key injected **server-side**, so users
+never see the endpoint key in their browser.
 
-## How it works
+## Features
+
+- **SSO identity mapping** — reads `X-Authentik-Uid` / `X-Authentik-Username`
+  headers injected by the Authentik proxy outpost and rewrites them to the
+  mapped SillyTavern handle, so SillyTavern's native SSO login just works.
+- **Auto-provisioning** — a new Authentik user is automatically created as a
+  SillyTavern account on first page load (via a passwordless admin session).
+- **Default API config injection** — after provisioning, the user's
+  `settings.json` / `secrets.json` are written with a default Chat Completion
+  connection pointing at the sidecar's own `/v1` endpoint, so the user can
+  start chatting immediately without configuring anything.
+- **Server-side API key proxy** — `/v1/*` is forwarded to the upstream API
+  channel with `Authorization: Bearer <API_KEY>` injected by the sidecar.
+  Users only ever see a placeholder key; the real key lives in the sidecar's
+  environment. A model whitelist rejects any other model with HTTP 400.
+
+## Architecture
 
 ```
-Browser → Authentik outpost → sso-sidecar → SillyTavern
+Browser ──► NPM/nginx ──► Authentik proxy outpost ──► sso-sidecar ──► SillyTavern
+                 │                │                        │
+                 │                └─ X-Authentik-Uid ──────┤
+                 │                                         └─ /v1/* ──► upstream LLM API (key injected here)
 ```
-
-Authentik's proxy outpost authenticates the user and forwards identity headers
-(`X-Authentik-Uid`, `X-Authentik-Username`, `X-Authentik-Groups`, ...).
-SillyTavern's native SSO mode trusts `X-Authentik-Username` and auto-logs-in /
-creates the account on first visit — but it keys accounts off the **username
-string**, so a renamed user or changed email breaks the mapping.
-
-This sidecar sits between the outpost and SillyTavern and:
-
-1. Reads the stable `X-Authentik-Uid` (UUID) from the outpost headers.
-2. Maps uid → existing ST handle via a `ssoUid` field stamped into ST's
-   `_storage` user records (the sidecar mounts the same data volume).
-3. Auto-provisions a new ST account on first login (admin session via a
-   passwordless admin account + ST's admin API).
-4. Rewrites `X-Authentik-Username` to the mapped handle so ST's native SSO
-   always sees a consistent identity.
-
-## Requirements
-
-- Authentik proxy provider + outpost in front of this sidecar
-- SillyTavern with:
-  - `whitelistMode: true`
-  - `enableForwardedWhitelist: false`
-  - the outpost container IP added to the whitelist
-- A **passwordless** (no password set) admin account in SillyTavern,
-  used only for auto-provisioning API calls
 
 ## Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `ST_BACKEND` | `http://sillytavern:8000` | Upstream SillyTavern address |
+| `ST_BACKEND` | `http://sillytavern:8000` | SillyTavern upstream URL |
 | `LISTEN_PORT` | `8001` | Sidecar listen port |
-| `ADMIN_HANDLE` | `admin` | Passwordless admin handle for auto-provisioning |
-| `ADMIN_GROUPS` | `admins,staff` | Comma-separated Authentik group names that map to ST admins |
-| `ST_DATA_DIR` | `/st-data/data` | Where the SillyTavern data volume is mounted |
+| `ADMIN_HANDLE` | `admin` | SillyTavern admin handle used for auto-provisioning (must be passwordless + enabled) |
+| `ADMIN_GROUPS` | `admins,staff` | Authentik groups that map to SillyTavern admins |
+| `ST_DATA_DIR` | `/st-data/data` | Mounted SillyTavern data root |
+| `API_BASE_URL` | `https://api.example.com/v1` | Upstream LLM API base URL (proxied at `/v1/*`) |
+| `API_KEY` | *(empty)* | Real API key, injected server-side only |
+| `ALLOWED_MODELS` | `deepseek-v4-flash` | Comma-separated model whitelist |
+| `DEFAULT_MODEL` | first allowed model | Model written into user settings |
+| `ST_API_BASE` | `https://st.example.com/v1` | Browser-facing API endpoint written into user settings |
 
-## Deployment (docker compose)
+## Requirements
+
+- SillyTavern with `enableUserAccounts: true` and a passwordless admin account
+- Authentik proxy provider/outpost forwarding `X-Authentik-*` headers
+
+## Example compose snippet
 
 ```yaml
 services:
-  sillytavern:
-    image: ghcr.io/sillytavern/sillytavern:latest
-    container_name: sillytavern
-    restart: unless-stopped
-    volumes:
-      - ./data/config:/home/node/app/config
-      - ./data/data:/home/node/app/data
-      - ./data/plugins:/home/node/app/plugins
-      - ./data/extensions:/home/node/app/public/scripts/extensions/third-party
-    networks:
-      - authentik_default
-
   sso-sidecar:
     build: ./sso-sidecar
     container_name: sso-sidecar
@@ -68,53 +62,22 @@ services:
     environment:
       ST_BACKEND: http://sillytavern:8000
       LISTEN_PORT: "8001"
-      ADMIN_HANDLE: "admin"              # must be passwordless in ST
-      ADMIN_GROUPS: "admins,staff"       # Authentik groups → ST admin
+      ADMIN_HANDLE: "admin"
+      ADMIN_GROUPS: "admins,staff"
+      API_BASE_URL: ${API_BASE_URL}
+      API_KEY: ${API_KEY}
+      ALLOWED_MODELS: ${ALLOWED_MODELS:-deepseek-v4-flash}
     volumes:
       - ./data/data:/st-data/data
     networks:
       - authentik_default
-    depends_on:
-      - sillytavern
-
-  authentik-proxy-outpost:
-    image: ghcr.io/goauthentik/proxy:2026.5.6
-    container_name: authentik-proxy-outpost
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:9200:9000"
-    environment:
-      AUTHENTIK_HOST: https://auth.example.com
-      AUTHENTIK_TOKEN: ${AUTHENTIK_OUTPOST_TOKEN}
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    networks:
-      - authentik_default
-    depends_on:
-      - sso-sidecar
-
-networks:
-  authentik_default:
-    external: true
 ```
 
-Authentik proxy provider settings:
+## Security notes
 
-- **External host**: the public URL of SillyTavern
-- **Internal host**: `http://sso-sidecar:8001`
-- Headers forwarded by the outpost (`X-Authentik-Uid`, etc.) are on by default
-
-## Health check
-
-```
-GET /_sso_health
-```
-
-## Caveats
-
-- The `ssoUid` stamping relies on the sidecar writing ST's `_storage` records
-  directly; keep the data volume mounted read-write.
-- Auto-provisioning needs a fresh CSRF token after the admin login (ST rotates
-  the session); the code fetches it twice for this reason.
-- The mapping cache is in-memory, so a sidecar restart re-scans `_storage`
-  on the next request — no data loss.
+- The real API key must only ever live in the sidecar's environment
+  (e.g. `.env`), never in user data or the browser.
+- Model whitelist is enforced at the sidecar; SillyTavern's own model picker
+  is not locked down — users changing the model get HTTP 400 from the sidecar.
+- The sidecar is not a general-purpose internet proxy: keep it behind the
+  Authentik outpost / an authenticated reverse proxy.

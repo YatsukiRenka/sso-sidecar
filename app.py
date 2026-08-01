@@ -20,11 +20,19 @@ from aiohttp import web, ClientSession, ClientTimeout
 # ─── Config ──────────────────────────────────────────────────────────────────
 ST_BACKEND = os.getenv("ST_BACKEND", "http://sillytavern:8000")
 LISTEN_PORT = int(os.getenv("LISTEN_PORT", "8001"))
+# Upstream API channel. The sidecar proxies /v1/* to this base URL and injects
+# the real API key server-side, so users never see it in their browser.
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api.example.com/v1").rstrip("/")
+API_KEY = os.getenv("API_KEY", "")
+ALLOWED_MODELS = {m.strip() for m in os.getenv("ALLOWED_MODELS", "deepseek-v4-flash").split(",") if m.strip()}
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", next(iter(ALLOWED_MODELS), "deepseek-v4-flash"))
+# Browser-facing endpoint written into user settings (routes back through this sidecar)
+API_URL_FOR_USERS = os.getenv("ST_API_BASE", "https://st.example.com/v1").rstrip("/")
 # admin handle used for auto-provisioning (must be passwordless + enabled)
 ADMIN_HANDLE = os.getenv("ADMIN_HANDLE", "admin")
 # groups that grant admin in SillyTavern
 ADMIN_GROUPS = set(os.getenv("ADMIN_GROUPS", "admins,staff").split(","))
-# where the ST data volume is mounted inside this container
+# Root of the SillyTavern data directory (mounted into this container)
 ST_DATA_DIR = os.getenv("ST_DATA_DIR", "/st-data/data")
 # slugify rule matching ST's lodash.slugify
 SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -157,6 +165,43 @@ async def st_create_user(session: ClientSession, csrf: str, handle: str, name: s
         return False
 
 
+# ─── Default API config injection ────────────────────────────────────────────
+
+def apply_default_api_config(handle: str) -> bool:
+    """
+    Write the default (sidecar-proxied) API connection into a user's settings.
+    The real channel key never touches user data — only a placeholder is stored,
+    and the sidecar injects the real key at request time.
+    """
+    user_dir = os.path.join(ST_DATA_DIR, handle)
+    settings_path = os.path.join(user_dir, "settings.json")
+    secrets_path = os.path.join(user_dir, "secrets.json")
+    try:
+        if os.path.exists(settings_path):
+            with open(settings_path, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+            oai = settings.setdefault("oai_settings", {})
+            oai["chat_completion_source"] = "custom"
+            oai["custom_url"] = API_URL_FOR_USERS
+            oai["custom_model"] = DEFAULT_MODEL
+            oai["openai_model"] = DEFAULT_MODEL
+            settings["main_api"] = "openai"
+            with open(settings_path, "w", encoding="utf-8") as f:
+                json.dump(settings, f, ensure_ascii=False, indent=2)
+        secrets = {}
+        if os.path.exists(secrets_path):
+            with open(secrets_path, "r", encoding="utf-8") as f:
+                secrets = json.load(f)
+        secrets["api_key_custom"] = "sk-st-sidecar-placeholder"
+        with open(secrets_path, "w", encoding="utf-8") as f:
+            json.dump(secrets, f, ensure_ascii=False, indent=2)
+        log.info(f"Injected default API config for '{handle}' → {API_URL_FOR_USERS}")
+        return True
+    except Exception as e:
+        log.error(f"apply_default_api_config({handle}) failed: {e}")
+        return False
+
+
 # ─── Auto-provisioning ───────────────────────────────────────────────────────
 
 async def ensure_user(uid: str, username: str, display_name: str, groups: str) -> Optional[str]:
@@ -217,6 +262,9 @@ async def ensure_user(uid: str, username: str, display_name: str, groups: str) -
     else:
         log.warning(f"User {handle} created but record not found for stamping")
 
+    # 5. Write the default API connection so the new user works out of the box
+    apply_default_api_config(handle)
+
     log.info(f"Auto-provisioned: uid={uid}, handle={handle}, admin={is_admin}")
     return handle
 
@@ -255,9 +303,69 @@ def is_static_request(path: str) -> bool:
         return True
     return False
 
+async def handle_api_proxy(request: web.Request, path: str) -> web.StreamResponse:
+    """
+    Proxy /v1/* to the upstream API channel, injecting the real API key
+    server-side and enforcing the allowed-models whitelist. Users never see
+    the real key, and models other than the whitelist are rejected.
+    """
+    # Model whitelist enforcement (only for requests carrying a JSON body)
+    body = None
+    if request.method in ("POST", "PUT", "PATCH"):
+        try:
+            body = await request.read()
+            payload = json.loads(body) if body else {}
+            model = payload.get("model")
+            if model and model not in ALLOWED_MODELS:
+                log.warning(f"Blocked model '{model}' (allowed: {sorted(ALLOWED_MODELS)})")
+                return web.json_response(
+                    {"error": {"message": f"Model '{model}' is not allowed. Allowed models: {', '.join(sorted(ALLOWED_MODELS))}"}},
+                    status=400,
+                )
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            body = None  # non-JSON body — pass through untouched below
+
+    # Build target URL: API_BASE_URL already includes /v1
+    rest = path[len("/v1"):] if path.startswith("/v1") else path
+    query = request.rel_url.query_string
+    target_url = f"{API_BASE_URL}{rest}" + (f"?{query}" if query else "")
+
+    # Headers: strip hop-by-hop, drop any client-supplied auth, inject real key
+    out_headers = {}
+    for key, val in request.headers.items():
+        if key.lower() in _HOP_BY_HOP or key.lower() in ("authorization", "x-api-key"):
+            continue
+        out_headers[key] = val
+    out_headers["Authorization"] = f"Bearer {API_KEY}"
+
+    timeout = ClientTimeout(total=300, sock_connect=15, sock_read=300)
+    async with ClientSession(timeout=timeout, auto_decompress=False, cookie_jar=None) as fwd_session:
+        async with fwd_session.request(
+            method=request.method,
+            url=target_url,
+            headers=out_headers,
+            data=body,
+            allow_redirects=False,
+        ) as upstream:
+            resp = web.StreamResponse(status=upstream.status, reason=upstream.reason)
+            for key, val in upstream.headers.items():
+                if key.lower() in _HOP_BY_HOP:
+                    continue
+                resp.headers.add(key, val)
+            await resp.prepare(request)
+            async for chunk in upstream.content.iter_any():
+                await resp.write(chunk)
+            await resp.write_eof()
+            return resp
+
+
 async def handle_request(request: web.Request) -> web.StreamResponse:
     """Transparent proxy: inject mapped username, forward everything else."""
     path = request.rel_url.path
+
+    # /v1/* goes straight to the upstream API channel (no SSO mapping needed)
+    if path == "/v1" or path.startswith("/v1/"):
+        return await handle_api_proxy(request, path)
 
     # Build outgoing headers
     out_headers = {}
