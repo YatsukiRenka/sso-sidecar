@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 YatsukiRenka
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Secure Authentik-to-SillyTavern SSO sidecar and narrow LLM API relay."""
 
 from __future__ import annotations
