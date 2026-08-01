@@ -39,6 +39,9 @@ SillyTavern server ---------------+-- /v1 -> upstream LLM API
   对象和允许列表中的模型进行校验与规范化，拒绝查询参数，移除客户端 Cookie
   与身份请求头，然后注入真实的上游密钥。模型端点根据 `ALLOWED_MODELS`
   在本地生成，因此不会泄露上游模型目录。
+- SillyTavern 从服务端发起中继请求，不会携带原始用户身份。因此受管账户共享
+  `API_PROXY_TOKEN`，Sidecar 无法归因单次中继使用，也无法只吊销某一个用户。
+  请在上游供应商处设置速率与费用限制；若令牌可能泄露，请轮换令牌。
 
 Authentik 文档说明，代理组使用竖线分隔（`foo|bar|baz`），Sidecar 也按此格式
 解析。参见
@@ -61,8 +64,10 @@ whitelist:
 enableForwardedWhitelist: false
 
 enableUserAccounts: true
+allowKeysExposure: false
 
 sso:
+  autheliaAuth: false
   authentikAuth: true
   trustedProxies:
     - 172.30.0.20 # sidecar 地址，而不是 Authentik outpost 地址
@@ -79,6 +84,19 @@ SillyTavern 1.18.0 默认将 `enableForwardedWhitelist` 设为 `true`。Sidecar
 才应保持启用，并添加所有获准的客户端 IP 或范围尽量收窄的 CIDR。若私有
 SillyTavern 后端应接受所有经 Authentik 身份验证并通过 Sidecar 的用户，请按
 上例设为 `false`，同时确保无法通过其他路径访问后端网络。
+
+请保持 `sso.autheliaAuth` 关闭。Sidecar 提供规范化后的
+`X-Authentik-Username` 身份；启用 Authelia 会额外引入一条基于
+`Remote-User` 的身份路径。Sidecar 会剥离替代身份请求头作为纵深防御，但未使用
+的认证模式仍应保持关闭。
+
+`allowKeysExposure: false` 同样是必需设置。受管用户会把中继凭据保存为
+SillyTavern 的 `api_key_custom`；启用密钥暴露后，该共享凭据可能通过密钥查看或
+用户备份功能泄露。
+
+面向浏览器的账户路由允许列表已按 SillyTavern 提交
+[`8172dcd0ee67`](https://github.com/SillyTavern/SillyTavern/commit/8172dcd0ee67)
+完成审计。部署其他版本、分支或预发布构建前，请重新核对这些路由。
 
 [SillyTavern SSO 文档](https://docs.sillytavern.app/administration/sso/)
 说明了受信任代理的要求。
@@ -107,10 +125,11 @@ SillyTavern 后端应接受所有经 Authentik 身份验证并通过 Sidecar 的
 |---|---|---|
 | `ST_BACKEND` | `http://sillytavern:8000` | 私有 SillyTavern URL |
 | `LISTEN_PORT` | `8001` | Sidecar 监听端口 |
+| `LOG_LEVEL` | `INFO` | 标准 Python 日志级别名称 |
 | `ADMIN_HANDLE` | `admin` | 受密码保护、用于预配的 SillyTavern 管理员账户 |
 | `ADMIN_PASSWORD` / `_FILE` | 必填 | 管理员密码；至少 20 个字符 |
 | `USER_PASSWORD_SECRET` / `_FILE` | 必填 | 用于派生受管用户密码的稳定密钥；至少 32 个字符 |
-| `ADMIN_GROUPS` | `admins,staff` | 授予 SillyTavern 管理员权限的 Authentik 组，以逗号分隔 |
+| `ADMIN_GROUPS` | `admins,staff` | 授予 SillyTavern 管理员权限的 Authentik 组，以逗号分隔；留空表示不允许任何 SSO 管理员 |
 | `AUTO_PROVISION` | `true` | 通过管理员 API 创建缺失的映射账户 |
 | `ALLOW_USERNAME_LINKING` | `false` | 允许用户名匹配的用户认领尚未绑定的已有账户名 |
 | `TRUSTED_PROXY_CIDRS` | 无 | 必填；以逗号分隔的 Authentik outpost 源 CIDR |
@@ -124,6 +143,10 @@ SillyTavern 后端应接受所有经 Authentik 身份验证并通过 Sidecar 的
 SillyTavern 账户。旧 `ssoUid` 记录会以只读方式导入，不需要启用此开关。
 如需有意执行一次性迁移来绑定尚未绑定的账户，请仅在目标用户登录期间启用此
 开关；验证状态文件后，再次将其禁用。
+
+身份缓存刷新时，Sidecar 会根据 `ADMIN_GROUPS` 对账管理员角色。因此，如果某个
+SSO 绑定账户的 Authentik 组不匹配此设置，对该账户的手工提权会被撤销；带外
+管理请使用独立的 `ADMIN_HANDLE` 账户。
 
 ### LLM 中继
 
@@ -224,6 +247,9 @@ secrets:
 
 ### Linux 宿主机权限
 
+运行镜像会在依赖安装完成后移除 `pip`，并将 `/app/app.py` 设置为 root 所有、
+权限为 `0444`。运行用户只能写入状态目录。
+
 镜像以 UID/GID `10001:10001` 运行。建议使用示例中的 `sidecar_state` 命名
 卷，因为它不会用任意宿主机目录覆盖镜像中已正确设置所有者的状态目录。如果
 改用 `./sidecar-state:/var/lib/sso-sidecar` 之类的绑定挂载，请在启动前为
@@ -281,7 +307,7 @@ Docker、用户命名空间和 Docker Desktop 可能采用不同方式转换所�
 
 ## 开发
 
-安装锁定版本的运行时依赖并执行回归测试套件：
+安装开发依赖并执行回归测试套件：
 
 ```sh
 python -m pip install -r requirements-dev.txt
@@ -291,7 +317,8 @@ python -m unittest discover -s tests -v
 python -m py_compile app.py
 ```
 
-测试套件覆盖中继身份验证与路由限制、编码路径遍历、有界分块请求体、敏感
+测试套件覆盖中继身份验证与路由限制、编码路径遍历、有界分块请求体、替代身份
 请求头移除、严格 JSON 与模型校验、有界流式及压缩 SSO 请求体、受信任代理
-强制检查、过期会话替换、原生账户路由拦截、经过凭据验证的重试行为、不可变
-UID 绑定、状态迁移、旧版记录健壮性以及 Authentik 组解析。
+强制检查、原始 Cookie 保真、重定向改写、账户路由默认拒绝、按 UID 并发预配、
+清晰的启动错误、经过凭据验证的重试、不可变 UID 绑定、状态迁移、旧版记录
+健壮性以及 Authentik 组解析。

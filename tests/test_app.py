@@ -1,8 +1,12 @@
+import asyncio
 import gzip
 import ipaddress
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, patch
@@ -251,6 +255,16 @@ class SsoProxyTests(unittest.IsolatedAsyncioTestCase):
                     "body": await request.read(),
                 }
             )
+            if request.path == "/absolute-redirect":
+                return web.Response(
+                    status=302,
+                    headers={"Location": f"{app.ST_BACKEND}/target?next=1#section"},
+                )
+            if request.path == "/external-redirect":
+                return web.Response(
+                    status=302,
+                    headers={"Location": "https://example.test/target"},
+                )
             response = web.Response(text="ok")
             response.set_cookie("theme", "dark")
             if request.path == "/login":
@@ -302,7 +316,7 @@ class SsoProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(401, response.status)
         self.assertEqual([], self.backend_requests)
 
-    async def test_native_account_and_provisioning_apis_are_not_forwarded(self):
+    async def test_unapproved_account_apis_are_not_forwarded(self):
         with patch.object(
             app, "ensure_user", AsyncMock(return_value="alice")
         ) as ensure:
@@ -322,6 +336,8 @@ class SsoProxyTests(unittest.IsolatedAsyncioTestCase):
                     "/api/users/delete",
                     "/API/USERS/LOGIN",
                     "/api//users/login",
+                    "/api/users",
+                    "/api/users/future-endpoint",
                 )
             ]
             base = str(self.sidecar_server.make_url("/"))
@@ -340,6 +356,32 @@ class SsoProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(response.status == 404 for response in responses))
         ensure.assert_not_awaited()
         self.assertEqual([], self.backend_requests)
+
+    async def test_only_reviewed_self_service_account_apis_are_forwarded(self):
+        allowed_paths = (
+            "/api/users/me",
+            "/api/users/logout",
+            "/api/users/backup",
+            "/api/users/change-avatar",
+            "/api/users/change-name",
+            "/api/users/reset-settings",
+            "/api/users/reset-step1",
+            "/api/users/reset-step2",
+        )
+        with patch.object(
+            app, "ensure_user", AsyncMock(return_value="alice")
+        ) as ensure:
+            responses = [
+                await self.client.post(path, json={}, headers=IDENTITY_HEADERS)
+                for path in allowed_paths
+            ]
+
+        self.assertTrue(all(response.status == 200 for response in responses))
+        self.assertEqual(
+            list(allowed_paths),
+            [item["path"] for item in self.backend_requests],
+        )
+        ensure.assert_awaited_once()
 
     async def test_transient_provisioning_failure_retries_without_fail_open(self):
         attempts = 0
@@ -374,6 +416,22 @@ class SsoProxyTests(unittest.IsolatedAsyncioTestCase):
         headers["Authorization"] = "Bearer must-not-leak"
         headers["Connection"] = "X-Connection-Leak"
         headers["X-Connection-Leak"] = "must-not-leak"
+        untrusted_identity_headers = {
+            "Remote-User": "admin",
+            "Remote-Email": "admin@example.test",
+            "Remote-Name": "Administrator",
+            "Remote-Groups": "admins",
+            "X-Remote-User": "admin",
+            "X-Forwarded-User": "admin",
+            "X-Forwarded-Email": "admin@example.test",
+            "X-Forwarded-Name": "Administrator",
+            "X-Forwarded-Groups": "admins",
+            "X-Forwarded-Preferred-Username": "admin",
+            "X-Auth-Request-User": "admin",
+            "X-Auth-Request-Groups": "admins",
+        }
+        headers.update(untrusted_identity_headers)
+        headers["X-Forwarded-Proto"] = "https"
         with patch.object(app, "ensure_user", AsyncMock(return_value="alice")):
             response = await self.client.get("/", headers=headers)
         self.assertEqual(200, response.status)
@@ -383,6 +441,10 @@ class SsoProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("X-Authentik-Jwt", forwarded)
         self.assertNotIn("Authorization", forwarded)
         self.assertNotIn("X-Connection-Leak", forwarded)
+        for name in untrusted_identity_headers:
+            with self.subTest(name=name):
+                self.assertNotIn(name, forwarded)
+        self.assertEqual("https", forwarded["X-Forwarded-Proto"])
 
     async def test_compressed_sso_body_is_decoded_once_and_streamed(self):
         plain_body = b'{"chat":"a sufficiently compressible payload"}'
@@ -454,7 +516,8 @@ class SsoProxyTests(unittest.IsolatedAsyncioTestCase):
     async def test_matching_identity_binding_preserves_only_backend_cookies(self):
         headers = dict(IDENTITY_HEADERS)
         headers["Cookie"] = (
-            "session-deadbeef=valid; "
+            "session-deadbeef=valid; duplicate=first; duplicate=second; "
+            'quoted="hello world"; '
             f"{app.SSO_BINDING_COOKIE_NAME}="
             f"{app.identity_binding_token('uid-alice')}"
         )
@@ -463,16 +526,140 @@ class SsoProxyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(200, response.status)
         forwarded = self.backend_requests[0]["headers"]
-        self.assertEqual("session-deadbeef=valid", forwarded["Cookie"])
+        self.assertEqual(
+            "session-deadbeef=valid; duplicate=first; duplicate=second; "
+            'quoted="hello world"',
+            forwarded["Cookie"],
+        )
         self.assertNotIn(app.SSO_BINDING_COOKIE_NAME, forwarded["Cookie"])
+
+    async def test_internal_absolute_redirect_is_rewritten_to_current_origin(self):
+        with patch.object(app, "ensure_user", AsyncMock(return_value="alice")):
+            response = await self.client.get(
+                "/absolute-redirect",
+                headers=IDENTITY_HEADERS,
+                allow_redirects=False,
+            )
+            external_response = await self.client.get(
+                "/external-redirect",
+                headers=IDENTITY_HEADERS,
+                allow_redirects=False,
+            )
+
+        self.assertEqual(302, response.status)
+        self.assertEqual("/target?next=1#section", response.headers["Location"])
+        self.assertEqual(
+            "https://example.test/target",
+            external_response.headers["Location"],
+        )
+
+    async def test_uid_provision_locks_are_scoped_and_reclaimed(self):
+        application = app.create_app(validate=False)
+        first_entered = asyncio.Event()
+        same_uid_entered = asyncio.Event()
+        other_uid_entered = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def worker(uid, entered, release=None):
+            async with app._uid_provision_lock(application, uid):
+                entered.set()
+                if release is not None:
+                    await release.wait()
+
+        first = asyncio.create_task(worker("uid-alice", first_entered, release_first))
+        await asyncio.wait_for(first_entered.wait(), timeout=1)
+        same_uid = asyncio.create_task(worker("uid-alice", same_uid_entered))
+        other_uid = asyncio.create_task(worker("uid-bob", other_uid_entered))
+
+        await asyncio.wait_for(other_uid_entered.wait(), timeout=1)
+        await asyncio.sleep(0)
+        self.assertFalse(same_uid_entered.is_set())
+        release_first.set()
+        await asyncio.gather(first, same_uid, other_uid)
+
+        self.assertTrue(same_uid_entered.is_set())
+        self.assertEqual({}, application[app.PROVISION_LOCKS_KEY])
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_invalid_import_time_values_are_reported_without_traceback(self):
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "LISTEN_PORT": "eight thousand",
+                "AUTO_PROVISION": "sometimes",
+                "API_PROXY_ENABLED": "perhaps",
+                "LOG_LEVEL": "verbose",
+            }
+        )
+        environment.pop("ADMIN_PASSWORD", None)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            environment["ADMIN_PASSWORD_FILE"] = os.path.join(
+                temporary_directory, "missing-secret"
+            )
+            completed = subprocess.run(
+                [sys.executable, os.path.abspath(app.__file__)],
+                cwd=os.path.dirname(os.path.abspath(app.__file__)),
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+        output = completed.stdout + completed.stderr
+        self.assertEqual(2, completed.returncode, output)
+        self.assertIn("LISTEN_PORT must be an integer", output)
+        self.assertIn("cannot read ADMIN_PASSWORD_FILE", output)
+        self.assertIn("AUTO_PROVISION must be true or false", output)
+        self.assertIn("API_PROXY_ENABLED must be true or false", output)
+        self.assertIn("LOG_LEVEL must name a standard Python logging level", output)
+        self.assertNotIn("ADMIN_PASSWORD must be set to at least 20 characters", output)
+        self.assertNotIn("API_BASE_URL must not use the example placeholder", output)
+        self.assertNotIn("Traceback", output)
+
+    def test_log_level_parser_preserves_standard_aliases(self):
+        with patch.dict(os.environ, {"LOG_LEVEL": "warn"}):
+            self.assertEqual("WARN", app.env_log_level("LOG_LEVEL", "INFO"))
+
     def test_http_urls_reject_whitespace_credentials_and_invalid_ports(self):
         self.assertTrue(app._valid_http_url("https://api.example.test/v1"))
         self.assertFalse(app._valid_http_url("http://bad host/v1"))
         self.assertFalse(app._valid_http_url("https://user:pass@example.test/v1"))
         self.assertFalse(app._valid_http_url("https://example.test:70000/v1"))
+
+    def test_internal_absolute_redirects_compare_normalized_origins(self):
+        self.assertEqual(
+            "/login?next=%2F#form",
+            app._same_origin_relative_location(
+                "HTTP://SILLYTAVERN.:80/login?next=%2F#form",
+                "http://sillytavern",
+            ),
+        )
+        self.assertEqual(
+            "/.//external.example/path",
+            app._same_origin_relative_location(
+                "http://sillytavern//external.example/path",
+                "http://sillytavern:80",
+            ),
+        )
+        self.assertEqual(
+            "/network-path",
+            app._same_origin_relative_location(
+                "//sillytavern:8000/network-path",
+                "http://sillytavern:8000",
+            ),
+        )
+        zero_port = "http://sillytavern:0/not-the-default-port"
+        self.assertEqual(
+            zero_port,
+            app._same_origin_relative_location(zero_port, "http://sillytavern"),
+        )
+        external = "https://login.example.test/start"
+        self.assertEqual(
+            external,
+            app._same_origin_relative_location(external, "http://sillytavern"),
+        )
 
     def test_relay_token_must_not_equal_upstream_key(self):
         shared_secret = "shared-secret-that-is-at-least-32-characters"
@@ -588,6 +775,49 @@ class StateAndProvisioningTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual("alice", app.find_mapping("uid-old").handle)
 
+    def test_provisioning_administrator_cannot_be_saved_as_a_mapping(self):
+        with self.assertRaises(app.IdentityConflict):
+            app.save_mapping(
+                "uid-admin",
+                "admin",
+                provisioned=True,
+                managed=False,
+            )
+        self.assertFalse(os.path.exists(self.state_file))
+
+    def test_legacy_administrator_mapping_is_rejected_without_import(self):
+        path = app.storage_path("admin")
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(
+                {"handle": "admin", "ssoUid": "uid-legacy-admin"},
+                file,
+            )
+
+        with self.assertRaises(app.IdentityConflict):
+            app.find_mapping("uid-legacy-admin")
+        self.assertFalse(os.path.exists(self.state_file))
+
+    def test_manually_injected_administrator_mapping_invalidates_state(self):
+        os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+        with open(self.state_file, "w", encoding="utf-8") as file:
+            json.dump(
+                {
+                    "version": 2,
+                    "mappings": {
+                        "uid-manual-admin": {
+                            "handle": "admin",
+                            "provisioned": True,
+                            "managed": False,
+                            "api_config_digest": "",
+                        }
+                    },
+                },
+                file,
+            )
+
+        with self.assertRaises(app.StateError):
+            app.find_mapping("uid-manual-admin")
+
     def test_scalar_legacy_storage_record_is_ignored(self):
         path = app.storage_path("alice")
         with open(path, "w", encoding="utf-8") as file:
@@ -598,6 +828,43 @@ class StateAndProvisioningTests(unittest.IsolatedAsyncioTestCase):
     async def test_authentik_pipe_groups_control_admin_role(self):
         self.assertTrue(app.groups_grant_admin("users|admins"))
         self.assertFalse(app.groups_grant_admin("users,admins"))
+
+    async def test_ensure_user_runs_state_reads_outside_the_event_loop(self):
+        event_loop_thread = threading.get_ident()
+        state_threads = []
+
+        def tracked_find_mapping(_uid):
+            state_threads.append(threading.get_ident())
+            return app.MappingRecord(
+                handle="alice",
+                provisioned=True,
+                managed=False,
+                api_config_digest="",
+            )
+
+        @asynccontextmanager
+        async def fake_admin_session():
+            yield object(), "csrf"
+
+        with (
+            patch.object(app, "find_mapping", tracked_find_mapping),
+            patch.object(app, "st_admin_session", fake_admin_session),
+            patch.object(
+                app,
+                "st_list_users",
+                AsyncMock(
+                    return_value=[{"handle": "alice", "enabled": True, "admin": False}]
+                ),
+            ),
+            patch.object(app, "st_sync_admin_role", AsyncMock()),
+        ):
+            self.assertEqual(
+                "alice",
+                await app.ensure_user("uid-alice", "Alice", "Alice", "users"),
+            )
+
+        self.assertEqual(1, len(state_threads))
+        self.assertNotEqual(event_loop_thread, state_threads[0])
 
     async def test_existing_username_is_not_claimed_by_default(self):
         @asynccontextmanager

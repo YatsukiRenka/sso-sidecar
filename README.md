@@ -44,6 +44,11 @@ SillyTavern server ---------------+-- /v1 -> upstream LLM API
   parameters, strips client cookies and identity headers, and then injects the
   real upstream key. The models endpoint is generated locally from
   `ALLOWED_MODELS`, so it does not disclose the upstream catalog.
+- SillyTavern emits relay requests server-side without the originating user's
+  identity. Managed accounts therefore share `API_PROXY_TOKEN`: the sidecar
+  cannot attribute relay use or revoke one user's access independently. Apply
+  rate and spend limits at the upstream provider, and rotate the token if it
+  may have been exposed.
 
 Authentik documents that proxy groups are pipe-separated (`foo|bar|baz`),
 which is the format this sidecar parses. See the
@@ -67,8 +72,10 @@ whitelist:
 enableForwardedWhitelist: false
 
 enableUserAccounts: true
+allowKeysExposure: false
 
 sso:
+  autheliaAuth: false
   authentikAuth: true
   trustedProxies:
     - 172.30.0.20 # the sidecar address, not the Authentik outpost address
@@ -88,6 +95,21 @@ intentional, and add every permitted client IP or narrowly scoped CIDR. For a
 private SillyTavern backend that should accept all Authentik-authenticated
 users through the sidecar, use `false` as shown above and keep the backend
 network inaccessible by any other route.
+
+Keep `sso.autheliaAuth` disabled. The sidecar supplies the normalized
+`X-Authentik-Username` identity, while enabling Authelia would add a second
+`Remote-User` identity path. The sidecar strips alternative identity headers
+as defense in depth, but the unused authentication mode should still remain
+off.
+
+`allowKeysExposure: false` is also required. Managed users store the relay
+credential as SillyTavern's `api_key_custom`; enabling key exposure can reveal
+that shared credential through secret-view or user-backup features.
+
+The browser-facing account-route allowlist was audited against SillyTavern
+commit [`8172dcd0ee67`](https://github.com/SillyTavern/SillyTavern/commit/8172dcd0ee67).
+Re-audit those routes before deploying a different release, fork, or staging
+build.
 
 The [SillyTavern SSO documentation](https://docs.sillytavern.app/administration/sso/)
 explains the trusted-proxy requirement.
@@ -117,10 +139,11 @@ These controls intentionally apply at different hops:
 |---|---|---|
 | `ST_BACKEND` | `http://sillytavern:8000` | Private SillyTavern URL |
 | `LISTEN_PORT` | `8001` | Sidecar listen port |
+| `LOG_LEVEL` | `INFO` | Standard Python logging level name |
 | `ADMIN_HANDLE` | `admin` | Password-protected SillyTavern provisioning administrator |
 | `ADMIN_PASSWORD` / `_FILE` | required | Administrator password; minimum 20 characters |
 | `USER_PASSWORD_SECRET` / `_FILE` | required | Stable key used to derive managed-user passwords; minimum 32 characters |
-| `ADMIN_GROUPS` | `admins,staff` | Comma-separated Authentik groups that grant SillyTavern admin |
+| `ADMIN_GROUPS` | `admins,staff` | Comma-separated Authentik groups that grant SillyTavern admin; empty means no SSO administrators |
 | `AUTO_PROVISION` | `true` | Create a missing mapped account through the admin API |
 | `ALLOW_USERNAME_LINKING` | `false` | Allow an unbound pre-existing handle to be claimed by a matching username |
 | `TRUSTED_PROXY_CIDRS` | none | Required comma-separated Authentik outpost source CIDRs |
@@ -135,6 +158,11 @@ existing SillyTavern account. Old `ssoUid` records are imported read-only and
 do not require this switch. For a deliberate one-time migration of unbound
 accounts, enable the switch only while the intended users sign in, verify the
 state file, and disable it again.
+
+Admin roles are reconciled from `ADMIN_GROUPS` whenever an identity cache
+entry is refreshed. A manual promotion of an SSO-bound account whose Authentik
+groups do not match this setting will therefore be reverted; use the separate
+`ADMIN_HANDLE` account for out-of-band administration.
 
 ### LLM relay
 
@@ -237,6 +265,10 @@ secrets:
 
 ### Linux host permissions
 
+The runtime image removes `pip` after dependency installation and installs
+`/app/app.py` as root-owned mode `0444`. Only the state directory is writable
+by the runtime user.
+
 The image runs as UID/GID `10001:10001`. The named `sidecar_state` volume in
 the example is recommended because it does not overlay the image-owned state
 directory with an arbitrary host directory. If you replace it with a bind
@@ -302,7 +334,7 @@ reach the configured LLM provider, or attach a separate egress network.
 
 ## Development
 
-Install the pinned runtime dependency and run the regression suite:
+Install the development dependencies and run the regression suite:
 
 ```sh
 python -m pip install -r requirements-dev.txt
@@ -313,8 +345,9 @@ python -m py_compile app.py
 ```
 
 The test suite covers relay authentication and route restrictions, encoded
-path traversal, bounded chunked bodies, sensitive-header stripping,
+path traversal, bounded chunked bodies, alternative-identity header stripping,
 strict JSON and model validation, bounded streaming and compressed SSO bodies,
-trusted proxy enforcement, stale-session replacement, blocked native account
-routes, credential-verified retry behavior, immutable UID bindings, state
-migration, legacy-record robustness, and Authentik group parsing.
+trusted proxy enforcement, raw cookie preservation, redirect rewriting,
+fail-closed account routes, per-UID provisioning concurrency, clean startup
+errors, credential-verified retries, immutable UID bindings, state migration,
+legacy-record robustness, and Authentik group parsing.

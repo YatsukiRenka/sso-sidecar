@@ -12,10 +12,12 @@ RUN groupadd --gid 10001 sidecar \
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --requirement requirements.txt
+RUN python -m pip install --requirement requirements.txt \
+    && python -m pip uninstall --yes pip
 
-COPY --chown=sidecar:sidecar app.py .
-RUN mkdir -p /var/lib/sso-sidecar \
+COPY --chown=root:root app.py .
+RUN chmod 0444 /app/app.py \
+    && mkdir -p /var/lib/sso-sidecar \
     && chown sidecar:sidecar /var/lib/sso-sidecar
 
 USER 10001:10001
