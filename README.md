@@ -1,5 +1,7 @@
 # SillyTavern SSO Sidecar
 
+**Language:** English | [简体中文](README.zh-CN.md)
+
 A fail-closed reverse proxy between an Authentik proxy outpost and
 SillyTavern. It maps stable Authentik UIDs to SillyTavern handles, safely
 provisions accounts, reconciles admin-group membership, and exposes a narrow
