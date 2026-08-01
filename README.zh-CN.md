@@ -287,6 +287,79 @@ Docker、用户命名空间和 Docker Desktop 可能采用不同方式转换所�
 确保网络仍允许 Sidecar 访问已配置的 LLM 提供商；也可以为其连接单独的出口
 网络。
 
+## 更新
+
+以下步骤假设使用上面的源码构建 Compose 示例，代码检出路径为
+`./sso-sidecar`，服务名为 `sso-sidecar`。如果实际部署不同，请相应替换路径或
+服务名。
+
+### 更新前
+
+1. 记录当前部署的修订版本，以便需要时重新构建并回滚：
+
+   ```sh
+   git -C ./sso-sidecar rev-parse HEAD
+   ```
+
+2. 在原容器仍然存在时备份身份映射：
+
+   ```sh
+   install -d -m 0700 ./backup
+   docker compose cp \
+     sso-sidecar:/var/lib/sso-sidecar/mappings.json \
+     ./backup/mappings.json.pre-upgrade
+   ```
+
+   如果尚未生成映射文件，可以跳过复制。备份中不含账户密码，但包含稳定身份
+   映射，仍应妥善保管。
+
+3. 保留现有 `sidecar_state` 卷和全部已配置密钥。尤其不能随意更换
+   `USER_PASSWORD_SECRET`，否则 Sidecar 将无法验证已有受管账户。更新过程中
+   不要运行 `docker compose down --volumes`。
+
+4. 对照[必需的 SillyTavern 配置](#sillytavern-必需配置)和当前环境变量表检查
+   部署。从 [`cf99d6f`](https://github.com/YatsukiRenka/sso-sidecar/commit/cf99d6f26257d759ed4d03d627ebad02478e9921)
+   之前的版本升级时，请确保已设置 `allowKeysExposure: false` 和
+   `sso.autheliaAuth: false`。现在，整数、布尔值、日志级别、URL 或密钥文件配置
+   无效时会在启动阶段清晰地失败，不再被隐式接受。
+
+### 重建并替换 Sidecar
+
+在包含 Compose 文件的目录中运行：
+
+```sh
+git -C ./sso-sidecar switch main
+git -C ./sso-sidecar pull --ff-only origin main
+docker compose config --quiet
+docker compose build --pull sso-sidecar
+docker compose up --detach --no-deps --wait sso-sidecar
+docker compose logs --tail=100 sso-sidecar
+```
+
+如果修改了 SillyTavern 的必需设置，请先按照现有部署方式重启或重新创建
+SillyTavern，再测试 SSO。单独运行 `docker compose restart` 不会应用发生变化的
+镜像或环境变量，因此上面的流程使用 `up`。
+
+确认服务健康后，依次测试普通用户 SSO 登录、适用时的管理员组用户登录以及已
+配置的 LLM 中继。`cf99d6f` 引入的更新没有改变映射状态格式，无需手工迁移
+状态。
+
+### 回滚
+
+检出更新前记录的修订版本，重新构建并只重建 Sidecar：
+
+```sh
+git -C ./sso-sidecar switch --detach <previous-revision>
+docker compose build sso-sidecar
+docker compose up --detach --no-deps --wait sso-sidecar
+docker compose logs --tail=100 sso-sidecar
+```
+
+不要删除状态卷。本次更新不要求恢复映射备份，应将其保留为恢复副本。如果未来
+版本明确更改了状态格式，请遵循该版本的迁移说明，并且只在 Sidecar 停止时恢复
+对应备份，同时保持 UID/GID 为 `10001:10001`。准备再次尝试升级时，运行
+`git -C ./sso-sidecar switch main`。
+
 ## 映射与故障行为
 
 - 状态文件中已有的 UID 始终映射到同一个账户名，即使 Authentik 用户名发生

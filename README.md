@@ -310,6 +310,89 @@ Point the Authentik proxy provider's internal host at
 `http://sso-sidecar:8001`. Make sure the network still permits the sidecar to
 reach the configured LLM provider, or attach a separate egress network.
 
+## Updating
+
+These steps assume the source-build Compose example above, a checkout at
+`./sso-sidecar`, and a service named `sso-sidecar`. Adapt the checkout path or
+service name if your deployment differs.
+
+### Before updating
+
+1. Record the currently deployed revision so that it can be rebuilt if a
+   rollback is needed:
+
+   ```sh
+   git -C ./sso-sidecar rev-parse HEAD
+   ```
+
+2. Back up the identity mapping while the existing container is still
+   available:
+
+   ```sh
+   install -d -m 0700 ./backup
+   docker compose cp \
+     sso-sidecar:/var/lib/sso-sidecar/mappings.json \
+     ./backup/mappings.json.pre-upgrade
+   ```
+
+   Skip the copy if no mapping file exists yet. Keep the backup private: it
+   contains stable identity mappings, although it does not contain account
+   passwords.
+
+3. Keep the existing `sidecar_state` volume and all configured secrets. In
+   particular, changing `USER_PASSWORD_SECRET` prevents the sidecar from
+   verifying existing managed accounts. Do not run `docker compose down
+   --volumes` as part of an update.
+
+4. Compare the deployment with [Required SillyTavern configuration](#required-sillytavern-configuration)
+   and the current environment-variable tables. When upgrading from a revision
+   before [`cf99d6f`](https://github.com/YatsukiRenka/sso-sidecar/commit/cf99d6f26257d759ed4d03d627ebad02478e9921), ensure that
+   `allowKeysExposure: false` and `sso.autheliaAuth: false` are present. Invalid
+   integer, boolean, log-level, URL, or secret-file settings now fail cleanly at
+   startup instead of being accepted implicitly.
+
+### Rebuild and replace the sidecar
+
+Run these commands from the directory containing the Compose file:
+
+```sh
+git -C ./sso-sidecar switch main
+git -C ./sso-sidecar pull --ff-only origin main
+docker compose config --quiet
+docker compose build --pull sso-sidecar
+docker compose up --detach --no-deps --wait sso-sidecar
+docker compose logs --tail=100 sso-sidecar
+```
+
+If the required SillyTavern settings changed, restart or recreate SillyTavern
+using that deployment's normal procedure before testing SSO. A plain
+`docker compose restart` does not apply changed image or environment
+configuration, which is why the commands above use `up`.
+
+Confirm that the service is healthy, then test an ordinary SSO login, an
+administrator-group login if applicable, and the configured LLM relay. The
+update introduced in `cf99d6f` does not change the mapping-state format, so no
+manual state migration is required.
+
+### Rollback
+
+Check out the revision recorded before the update, rebuild the same service,
+and recreate only the sidecar:
+
+```sh
+git -C ./sso-sidecar switch --detach <previous-revision>
+docker compose build sso-sidecar
+docker compose up --detach --no-deps --wait sso-sidecar
+docker compose logs --tail=100 sso-sidecar
+```
+
+Do not delete the state volume. This update does not require restoring the
+mapping backup; retain it as a recovery copy. If a future release explicitly
+changes the state format, follow that release's migration notes and restore a
+matching backup only while the sidecar is stopped, preserving UID/GID
+`10001:10001`. Run `git -C ./sso-sidecar switch main` when ready to retry the
+upgrade.
+
 ## Mapping and failure behavior
 
 - A UID already in the state file always maps to the same handle, even if the
