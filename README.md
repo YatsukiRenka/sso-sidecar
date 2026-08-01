@@ -49,10 +49,21 @@ which is the format this sidecar parses. See the
 
 ## Required SillyTavern configuration
 
-Configure multi-user mode and native Authentik SSO in SillyTavern's
-`config.yaml`:
+Configure multi-user mode, the network whitelist, and native Authentik SSO in
+SillyTavern's `config.yaml`. These settings match the fixed sidecar address in
+the Compose example below:
 
 ```yaml
+whitelistMode: true
+whitelist:
+  - ::1
+  - 127.0.0.1
+  - 172.30.0.20 # allow the sidecar's connection to SillyTavern
+
+# Recommended when Authentik serves users from addresses that are not all
+# listed above. See the explanation below before changing this to true.
+enableForwardedWhitelist: false
+
 enableUserAccounts: true
 
 sso:
@@ -61,10 +72,23 @@ sso:
     - 172.30.0.20 # the sidecar address, not the Authentik outpost address
 ```
 
-The sidecar address must be trusted because it is the immediate TCP peer that
-forwards the normalized Authentik headers to SillyTavern. The
-[SillyTavern SSO documentation](https://docs.sillytavern.app/administration/sso/)
-explains the same trusted-proxy requirement.
+The sidecar address must appear in both `whitelist` and `sso.trustedProxies`,
+but for different reasons: the first admits its network connection, while the
+second permits it to supply normalized Authentik identity headers. The default
+`whitelistDockerHosts: true` setting adds Docker host and gateway addresses,
+not the address of a sibling sidecar container.
+
+SillyTavern 1.18.0 defaults `enableForwardedWhitelist` to `true`. The sidecar
+preserves forwarded client-IP headers, so that setting makes SillyTavern
+require **both** the sidecar address and every forwarded client address to
+match `whitelist`. Keep it enabled only when client-IP allowlisting is
+intentional, and add every permitted client IP or narrowly scoped CIDR. For a
+private SillyTavern backend that should accept all Authentik-authenticated
+users through the sidecar, use `false` as shown above and keep the backend
+network inaccessible by any other route.
+
+The [SillyTavern SSO documentation](https://docs.sillytavern.app/administration/sso/)
+explains the trusted-proxy requirement.
 
 Also:
 
@@ -75,12 +99,13 @@ Also:
    narrowly scoped CIDRs). Configure the outpost address in
    `TRUSTED_PROXY_CIDRS`.
 
-The two trust lists intentionally contain different peers:
+These controls intentionally apply at different hops:
 
-| Setting | Trusts |
+| Setting | Allows |
 |---|---|
-| Sidecar `TRUSTED_PROXY_CIDRS` | Authentik outpost source address |
-| SillyTavern `sso.trustedProxies` | Sidecar source address |
+| Sidecar `TRUSTED_PROXY_CIDRS` | Authentik outpost source address to present identity |
+| SillyTavern `whitelist` | Sidecar source address to connect; also forwarded clients when `enableForwardedWhitelist: true` |
+| SillyTavern `sso.trustedProxies` | Sidecar source address to present SSO identity |
 
 ## Configuration
 
@@ -207,6 +232,45 @@ secrets:
   api_proxy_token:
     file: ./secrets/api_proxy_token
 ```
+
+### Linux host permissions
+
+The image runs as UID/GID `10001:10001`. The named `sidecar_state` volume in
+the example is recommended because it does not overlay the image-owned state
+directory with an arbitrary host directory. If you replace it with a bind
+mount such as `./sidecar-state:/var/lib/sso-sidecar`, create the source for the
+container user before startup:
+
+```sh
+sudo install -d -o 10001 -g 10001 -m 0700 ./sidecar-state
+```
+
+Any existing `mappings.json` must also be readable and writable by UID 10001.
+The sidecar creates a temporary file in the same directory and atomically
+replaces `mappings.json`, so making only the file writable is insufficient.
+
+Docker Compose implements a top-level `secrets.<name>.file` source as a bind
+mount. Every parent directory must therefore be searchable by the container
+user, and each secret file must be readable by UID or GID 10001. One
+least-privilege setup for the four files in this example is:
+
+```sh
+sudo chown root:10001 ./secrets ./secrets/*
+sudo chmod 0750 ./secrets
+sudo chmod 0440 ./secrets/*
+```
+
+Do not put `mode` under the top-level secret definitions: that field accepts a
+source such as `file`, not mount permissions. Service-level long syntax has
+`uid`, `gid`, and `mode` fields, but Docker Compose ignores them for a `file`
+source because it uses a bind mount. Set the permissions on the host files
+instead; the [Compose service-secrets reference](https://docs.docker.com/reference/compose-file/services/#secrets)
+documents this limitation.
+
+These commands assume a Linux Docker Engine without user-namespace remapping.
+Rootless Docker, user namespaces, and Docker Desktop can translate ownership
+differently; verify that the running container can read every configured
+`*_FILE` and write the directory containing `STATE_FILE`.
 
 Point the Authentik proxy provider's internal host at
 `http://sso-sidecar:8001`. Make sure the network still permits the sidecar to
