@@ -1,77 +1,129 @@
 # SillyTavern SSO Sidecar
 
-**语言：** 简体中文 | [English](README.en.md)
+**English** | [简体中文](README.zh-CN.md)
 
-一个部署在 Authentik 代理 outpost 与 SillyTavern 之间的 fail-closed 反向
-代理。它将稳定的 Authentik UID 映射到 SillyTavern handle，安全地预配账户、
-同步管理员组成员身份，并为兼容 OpenAI 的 LLM API 提供范围严格受限、使用
-服务身份验证的中继。
+A fail-closed reverse proxy between an [Authentik](https://goauthentik.io/)
+proxy outpost and [SillyTavern](https://github.com/SillyTavern/SillyTavern).
+It maps stable Authentik UIDs to SillyTavern handles, safely provisions
+accounts, reconciles admin-group membership, and exposes a narrow
+service-authenticated relay for an OpenAI-compatible LLM API.
 
-![](https://img.shields.io/badge/python-3.12-blue) ![](https://img.shields.io/badge/deps-aiohttp-green) [![](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE) [![](https://github.com/YatsukiRenka/sso-sidecar/actions/workflows/test.yml/badge.svg)](https://github.com/YatsukiRenka/sso-sidecar/actions/workflows/test.yml)
+![Python 3.12](https://img.shields.io/badge/python-3.12-blue)
+![Dependencies: aiohttp](https://img.shields.io/badge/deps-aiohttp-green)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+[![Tests](https://github.com/YatsukiRenka/sso-sidecar/actions/workflows/test.yml/badge.svg)](https://github.com/YatsukiRenka/sso-sidecar/actions/workflows/test.yml)
 
-## 安全模型
+## Contents
 
-Sidecar 将浏览器流量和 SillyTavern 服务端的 LLM 流量视为两条独立的信任路径：
+- [What it does](#what-it-does)
+- [Security model](#security-model)
+- [Required SillyTavern configuration](#required-sillytavern-configuration)
+- [Configuration](#configuration)
+  - [SSO and provisioning](#sso-and-provisioning)
+  - [LLM relay](#llm-relay)
+- [Compose example](#compose-example)
+  - [Linux host permissions](#linux-host-permissions)
+- [Updating](#updating)
+- [Mapping and failure behavior](#mapping-and-failure-behavior)
+- [Development](#development)
+- [License](#license)
+
+## What it does
+
+- **Single sign-on for SillyTavern.** Authentik stays the only source of
+  identity and roles; SillyTavern's own password login, recovery, and local
+  user administration are never forwarded.
+- **Stable identity.** A UID recorded once always maps to the same handle,
+  even when the Authentik username changes.
+- **Safe provisioning.** Missing accounts are created through the SillyTavern
+  admin API with a deterministic high-entropy password that never reaches a
+  browser, and admin rights are reconciled from Authentik groups.
+- **Scoped LLM relay.** A three-route `/v1` endpoint lets managed users reach
+  an upstream OpenAI-compatible API without ever holding the real key.
+- **Fail-closed throughout.** Untrusted source addresses, missing identity
+  headers, and provisioning or storage failures are rejected instead of being
+  passed through.
+
+**Requirements:** an Authentik proxy outpost, a SillyTavern instance kept on a
+private network, and either Docker (see the [Compose example](#compose-example))
+or Python 3.12 with `aiohttp`.
+
+New here? Read the [security model](#security-model), apply the
+[required SillyTavern configuration](#required-sillytavern-configuration), then
+deploy with the [Compose example](#compose-example).
+
+## Security model
+
+The sidecar treats browser traffic and SillyTavern's server-side LLM traffic
+as two separate trust paths:
 
 ```mermaid
 flowchart LR
     subgraph SC["sso-sidecar"]
-        P["/...<br/>SSO 反向代理"]
-        R["/v1<br/>LLM 中继"]
+        P["/...<br/>SSO reverse proxy"]
+        R["/v1<br/>LLM relay"]
     end
 
-    B["浏览器"] -->|"Authentik 会话"| O["Authentik outpost"]
+    B["Browser"] -->|"Authentik session"| O["Authentik outpost"]
     O -->|"X-Authentik-Uid<br/>X-Authentik-Username"| P
     P -->|"X-Authentik-Username: handle"| ST["SillyTavern"]
     ST -.->|"api_key_custom = API_PROXY_TOKEN"| R
-    R -->|"真实 API_KEY"| U["上游 LLM API"]
+    R -->|"real API_KEY"| U["upstream LLM API"]
 ```
 
-实线是浏览器发起的 SSO 路径，虚线是 SillyTavern 服务端发起的中继调用。
+The solid path is browser-initiated SSO traffic; the dotted edge is the relay
+call that SillyTavern makes server-side.
 
-- 普通 SillyTavern 请求只接受来自 `TRUSTED_PROXY_CIDRS` 所列地址的连接，
-  并且必须同时包含 `X-Authentik-Uid` 和 `X-Authentik-Username`。
-  身份信息缺失或来源不受信任时，请求会被拒绝。
-- Sidecar 不会转发 SillyTavern 原生的密码登录/找回、密码修改以及本地用户管理
-  端点。Authentik 始终是身份与角色的唯一事实来源。SillyTavern 后端也必须位于
-  私有网络中。
-- 预配过程使用受密码保护的 SillyTavern 管理员账户登录。新建的纯 SSO 用户会
-  获得一个确定性生成的高熵密码，该密码绝不会返回给浏览器。
-- 带签名的绑定 Cookie 会将 SillyTavern 的长期浏览器会话与稳定的 Authentik
-  UID 绑定。绑定缺失或不匹配时，Sidecar 会丢弃旧的后端 Cookie，直到
-  SillyTavern 为当前 SSO 身份签发会话 Cookie。这样可以防止浏览器切换用户后
-  复用上一位用户的 SillyTavern 会话。
-- UID 映射保存在 Sidecar 自己的状态文件中，并通过原子替换更新。
-  SillyTavern 的 `_storage`、`settings.json` 和 `secrets.json` 绝不会被
-  直接修改。每个 `STATE_FILE` 只能运行一个 Sidecar 副本；进程内锁无法协调
-  多个并发副本。
-- `/v1` 只接受 `GET /v1/models`、`POST /v1/chat/completions` 和
-  `POST /v1/completions`。它要求使用独立的 Bearer 中继令牌，对严格的 JSON
-  对象和允许列表中的模型进行校验与规范化，拒绝查询参数，移除客户端 Cookie
-  与身份请求头，然后注入真实的上游密钥。模型端点根据 `ALLOWED_MODELS`
-  在本地生成，因此不会泄露上游模型目录。
-- SillyTavern 从服务端发起中继请求，不会携带原始用户身份。因此受管账户共享
-  `API_PROXY_TOKEN`，Sidecar 无法归因单次中继使用，也无法只吊销某一个用户。
-  请在上游供应商处设置速率与费用限制；若令牌可能泄露，请轮换令牌。
+- Normal SillyTavern requests are accepted only from an address in
+  `TRUSTED_PROXY_CIDRS` and must contain both `X-Authentik-Uid` and
+  `X-Authentik-Username`. Missing or untrusted identity data fails closed.
+- Native password login/recovery, password changes, and SillyTavern's local
+  user-administration endpoints are not forwarded. Authentik remains the
+  identity and role source of truth. The SillyTavern backend must also stay on
+  a private network.
+- Provisioning logs in with a password-protected SillyTavern administrator.
+  New SSO-only users receive a deterministic high-entropy password that is
+  never returned to a browser.
+- A signed binding cookie ties SillyTavern's long-lived browser session to the
+  stable Authentik UID. A missing or mismatched binding discards the old
+  backend cookie until SillyTavern issues a session cookie for the current SSO
+  identity, preventing a browser user switch from reusing the previous user's
+  SillyTavern session.
+- UID mappings live in the sidecar's own atomically replaced state file.
+  SillyTavern's `_storage`, `settings.json`, and `secrets.json` are never
+  modified directly. Run exactly one sidecar replica for each `STATE_FILE`;
+  the in-process lock does not coordinate concurrent replicas.
+- `/v1` accepts only `GET /v1/models`, `POST /v1/chat/completions`, and
+  `POST /v1/completions`. It requires a separate bearer relay token, validates
+  and normalizes a strict JSON object and allowlisted model, rejects query
+  parameters, strips client cookies and identity headers, and then injects the
+  real upstream key. The models endpoint is generated locally from
+  `ALLOWED_MODELS`, so it does not disclose the upstream catalog.
+- SillyTavern emits relay requests server-side without the originating user's
+  identity. Managed accounts therefore share `API_PROXY_TOKEN`: the sidecar
+  cannot attribute relay use or revoke one user's access independently. Apply
+  rate and spend limits at the upstream provider, and rotate the token if it
+  may have been exposed.
 
-Authentik 文档说明，代理组使用竖线分隔（`foo|bar|baz`），Sidecar 也按此格式
-解析。参见
-[Authentik 代理请求头参考](https://docs.goauthentik.io/add-secure-apps/providers/proxy/#headers-sent-to-upstream-applications)。
+Authentik documents that proxy groups are pipe-separated (`foo|bar|baz`),
+which is the format this sidecar parses. See the
+[Authentik proxy header reference](https://docs.goauthentik.io/add-secure-apps/providers/proxy/#headers-sent-to-upstream-applications).
 
-## SillyTavern 必需配置
+## Required SillyTavern configuration
 
-请在 SillyTavern 的 `config.yaml` 中配置多用户模式、网络白名单和原生
-Authentik SSO。以下设置与后文 Compose 示例中的固定 Sidecar 地址一致：
+Configure multi-user mode, the network whitelist, and native Authentik SSO in
+SillyTavern's `config.yaml`. These settings match the fixed sidecar address in
+the Compose example below:
 
 ```yaml
 whitelistMode: true
 whitelist:
   - ::1
   - 127.0.0.1
-  - 172.30.0.20 # 允许 sidecar 连接 SillyTavern
+  - 172.30.0.20 # allow the sidecar's connection to SillyTavern
 
-# 当 Authentik 服务的用户地址并非全部列在上方时，建议使用此设置。
-# 改为 true 前请先阅读下方说明。
+# Recommended when Authentik serves users from addresses that are not all
+# listed above. See the explanation below before changing this to true.
 enableForwardedWhitelist: false
 
 enableUserAccounts: true
@@ -81,120 +133,130 @@ sso:
   autheliaAuth: false
   authentikAuth: true
   trustedProxies:
-    - 172.30.0.20 # sidecar 地址，而不是 Authentik outpost 地址
+    - 172.30.0.20 # the sidecar address, not the Authentik outpost address
 ```
 
-Sidecar 地址必须同时出现在 `whitelist` 和 `sso.trustedProxies` 中，但二者
-用途不同：前者允许 Sidecar 建立网络连接，后者允许它提供规范化后的 Authentik
-身份请求头。默认的 `whitelistDockerHosts: true` 只会加入 Docker 宿主机与
-网关地址，不会加入同级 Sidecar 容器的地址。
+The sidecar address must appear in both `whitelist` and `sso.trustedProxies`,
+but for different reasons: the first admits its network connection, while the
+second permits it to supply normalized Authentik identity headers. The default
+`whitelistDockerHosts: true` setting adds Docker host and gateway addresses,
+not the address of a sibling sidecar container.
 
-SillyTavern 1.18.0 默认将 `enableForwardedWhitelist` 设为 `true`。Sidecar
-会保留转发的客户端 IP 请求头，因此该设置会要求 Sidecar 地址和每个被转发的
-客户端地址**同时**匹配 `whitelist`。只有确实需要按客户端 IP 设置允许列表时
-才应保持启用，并添加所有获准的客户端 IP 或范围尽量收窄的 CIDR。若私有
-SillyTavern 后端应接受所有经 Authentik 身份验证并通过 Sidecar 的用户，请按
-上例设为 `false`，同时确保无法通过其他路径访问后端网络。
+SillyTavern 1.18.0 defaults `enableForwardedWhitelist` to `true`. The sidecar
+preserves forwarded client-IP headers, so that setting makes SillyTavern
+require **both** the sidecar address and every forwarded client address to
+match `whitelist`. Keep it enabled only when client-IP allowlisting is
+intentional, and add every permitted client IP or narrowly scoped CIDR. For a
+private SillyTavern backend that should accept all Authentik-authenticated
+users through the sidecar, use `false` as shown above and keep the backend
+network inaccessible by any other route.
 
-请保持 `sso.autheliaAuth` 关闭。Sidecar 提供规范化后的
-`X-Authentik-Username` 身份；启用 Authelia 会额外引入一条基于
-`Remote-User` 的身份路径。Sidecar 会剥离替代身份请求头作为纵深防御，但未使用
-的认证模式仍应保持关闭。
+Keep `sso.autheliaAuth` disabled. The sidecar supplies the normalized
+`X-Authentik-Username` identity, while enabling Authelia would add a second
+`Remote-User` identity path. The sidecar strips alternative identity headers
+as defense in depth, but the unused authentication mode should still remain
+off.
 
-`allowKeysExposure: false` 同样是必需设置。受管用户会把中继凭据保存为
-SillyTavern 的 `api_key_custom`；启用密钥暴露后，该共享凭据可能通过密钥查看或
-用户备份功能泄露。
+`allowKeysExposure: false` is also required. Managed users store the relay
+credential as SillyTavern's `api_key_custom`; enabling key exposure can reveal
+that shared credential through secret-view or user-backup features.
 
-面向浏览器的账户路由允许列表已按 SillyTavern commit
-[`8172dcd0ee67`](https://github.com/SillyTavern/SillyTavern/commit/8172dcd0ee67)
-完成审计。部署其他 release、fork 或 staging 构建前，请重新核对这些路由。
+The browser-facing account-route allowlist was audited against SillyTavern
+commit [`8172dcd0ee67`](https://github.com/SillyTavern/SillyTavern/commit/8172dcd0ee67).
+Re-audit those routes before deploying a different release, fork, or staging
+build.
 
-[SillyTavern SSO 文档](https://docs.sillytavern.app/administration/sso/)
-说明了受信任代理的要求。
+The [SillyTavern SSO documentation](https://docs.sillytavern.app/administration/sso/)
+explains the trusted-proxy requirement.
 
-此外：
+Also:
 
-1. 为 `ADMIN_HANDLE` 指定的 SillyTavern 账户设置强密码。绝不能让该管理员
-   账户没有密码。
-2. 保持 SillyTavern 端口私有，只有 Sidecar 可以访问它。
-3. 为 Authentik outpost 和 Sidecar 分配稳定的私有地址（或稳定且范围尽量
-   收窄的 CIDR），并在 `TRUSTED_PROXY_CIDRS` 中配置 outpost 地址。
+1. Set a strong password on the SillyTavern account named by `ADMIN_HANDLE`.
+   Never leave that administrator passwordless.
+2. Keep SillyTavern's port private. Only the sidecar should reach it.
+3. Assign the Authentik outpost and sidecar stable private addresses (or stable
+   narrowly scoped CIDRs). Configure the outpost address in
+   `TRUSTED_PROXY_CIDRS`.
 
-这些控制项有意作用于不同的网络跃点：
+These controls intentionally apply at different hops:
 
-| 设置 | 允许的行为 |
+| Setting | Allows |
 |---|---|
-| Sidecar `TRUSTED_PROXY_CIDRS` | Authentik outpost 的源地址提供身份信息 |
-| SillyTavern `whitelist` | Sidecar 的源地址建立连接；`enableForwardedWhitelist: true` 时还包括被转发的客户端 |
-| SillyTavern `sso.trustedProxies` | Sidecar 的源地址提供 SSO 身份信息 |
+| Sidecar `TRUSTED_PROXY_CIDRS` | Authentik outpost source address to present identity |
+| SillyTavern `whitelist` | Sidecar source address to connect; also forwarded clients when `enableForwardedWhitelist: true` |
+| SillyTavern `sso.trustedProxies` | Sidecar source address to present SSO identity |
 
-## 配置
+## Configuration
 
-### SSO 与账户预配
+### SSO and provisioning
 
-| 变量 | 默认值 | 说明 |
+| Variable | Default | Description |
 |---|---|---|
-| `ST_BACKEND` | `http://sillytavern:8000` | 私有 SillyTavern URL |
-| `LISTEN_PORT` | `8001` | Sidecar 监听端口 |
-| `LOG_LEVEL` | `INFO` | 标准 Python 日志级别名称 |
-| `ADMIN_HANDLE` | `admin` | 受密码保护、用于预配的 SillyTavern 管理员账户 |
-| `ADMIN_PASSWORD` / `_FILE` | 必填 | 管理员密码；至少 20 个字符 |
-| `USER_PASSWORD_SECRET` / `_FILE` | 必填 | 用于派生受管用户密码的稳定密钥；至少 32 个字符 |
-| `ADMIN_GROUPS` | `admins,staff` | 授予 SillyTavern 管理员权限的 Authentik 组，以逗号分隔；留空表示不允许任何 SSO 管理员 |
-| `AUTO_PROVISION` | `true` | 通过管理员 API 创建缺失的映射账户 |
-| `ALLOW_USERNAME_LINKING` | `false` | 允许 username 匹配的用户认领尚未绑定的已有 handle |
-| `TRUSTED_PROXY_CIDRS` | 无 | 必填；以逗号分隔的 Authentik outpost 源 CIDR |
-| `STATE_FILE` | `/var/lib/sso-sidecar/mappings.json` | Sidecar 自有的原子 UID 映射文件 |
-| `ST_DATA_DIR` | `/st-data/data` | 可选的只读旧版数据根目录，用于导入旧 `ssoUid` 映射 |
-| `UID_CACHE_TTL` | `300` | 成功的映射/角色缓存生存时间，单位为秒 |
-| `SSO_MAX_BODY_BYTES` | `524288000` | 解码后的 SillyTavern 请求最大大小；请求体采用流式传输而非整体缓冲 |
-| `SSO_BINDING_COOKIE_SECURE` | `true` | 为 UID 绑定 Cookie 设置 Secure；仅在本地纯 HTTP 测试时禁用 |
+| `ST_BACKEND` | `http://sillytavern:8000` | Private SillyTavern URL |
+| `LISTEN_PORT` | `8001` | Sidecar listen port |
+| `LOG_LEVEL` | `INFO` | Standard Python logging level name |
+| `ADMIN_HANDLE` | `admin` | Password-protected SillyTavern provisioning administrator |
+| `ADMIN_PASSWORD` / `_FILE` | required | Administrator password; minimum 20 characters |
+| `USER_PASSWORD_SECRET` / `_FILE` | required | Stable key used to derive managed-user passwords; minimum 32 characters |
+| `ADMIN_GROUPS` | `admins,staff` | Comma-separated Authentik groups that grant SillyTavern admin; empty means no SSO administrators |
+| `AUTO_PROVISION` | `true` | Create a missing mapped account through the admin API |
+| `ALLOW_USERNAME_LINKING` | `false` | Allow an unbound pre-existing handle to be claimed by a matching username |
+| `TRUSTED_PROXY_CIDRS` | none | Required comma-separated Authentik outpost source CIDRs |
+| `STATE_FILE` | `/var/lib/sso-sidecar/mappings.json` | Sidecar-owned atomic UID mapping file |
+| `ST_DATA_DIR` | `/st-data/data` | Optional read-only legacy data root for importing old `ssoUid` mappings |
+| `UID_CACHE_TTL` | `300` | Successful mapping/role cache lifetime in seconds |
+| `SSO_MAX_BODY_BYTES` | `524288000` | Maximum decoded SillyTavern request size; bodies are streamed rather than buffered |
+| `SSO_BINDING_COOKIE_SECURE` | `true` | Mark the UID-binding cookie Secure; disable only for local plain-HTTP testing |
 
-`ALLOW_USERNAME_LINKING=false` 可防止他人通过复用 username 接管已有的
-SillyTavern 账户。旧 `ssoUid` 记录会以只读方式导入，不需要启用此开关。
-如需有意执行一次性迁移来绑定尚未绑定的账户，请仅在目标用户登录期间启用此
-开关；验证状态文件后，再次将其禁用。
+`ALLOW_USERNAME_LINKING=false` prevents username reuse from taking over an
+existing SillyTavern account. Old `ssoUid` records are imported read-only and
+do not require this switch. For a deliberate one-time migration of unbound
+accounts, enable the switch only while the intended users sign in, verify the
+state file, and disable it again.
 
-身份缓存刷新时，Sidecar 会根据 `ADMIN_GROUPS` 对账管理员角色。因此，如果某个
-SSO 绑定账户的 Authentik 组不匹配此设置，对该账户的手工提权会被撤销；带外
-管理请使用独立的 `ADMIN_HANDLE` 账户。
+Admin roles are reconciled from `ADMIN_GROUPS` whenever an identity cache
+entry is refreshed. A manual promotion of an SSO-bound account whose Authentik
+groups do not match this setting will therefore be reverted; use the separate
+`ADMIN_HANDLE` account for out-of-band administration.
 
-### LLM 中继
+### LLM relay
 
-| 变量 | 默认值 | 说明 |
+| Variable | Default | Description |
 |---|---|---|
-| `API_PROXY_ENABLED` | `true` | 启用范围受限的 `/v1` 中继和默认用户配置 |
-| `API_BASE_URL` | 占位值 | 上游 OpenAI 兼容基础 URL，通常以 `/v1` 结尾 |
-| `API_KEY` / `_FILE` | 必填 | 真实的上游 API 密钥；绝不会写入用户数据 |
-| `API_PROXY_TOKEN` / `_FILE` | 必填 | 独立的随机 Bearer 中继令牌；至少 32 个字符 |
-| `ALLOWED_MODELS` | `deepseek-v4-flash` | 有顺序、以逗号分隔的模型允许列表 |
-| `DEFAULT_MODEL` | 允许列表中的第一个模型 | 也必须出现在 `ALLOWED_MODELS` 中 |
-| `ST_API_BASE` | `http://sso-sidecar:8001/v1` | 写入受管用户自定义 API 设置的内部 URL |
-| `API_MAX_BODY_BYTES` | `10485760` | 中继 JSON 请求体的最大大小 |
+| `API_PROXY_ENABLED` | `true` | Enable the narrow `/v1` relay and default user configuration |
+| `API_BASE_URL` | placeholder | Upstream OpenAI-compatible base URL, normally ending in `/v1` |
+| `API_KEY` / `_FILE` | required | Real upstream API key; never written to user data |
+| `API_PROXY_TOKEN` / `_FILE` | required | Independent random relay bearer token; minimum 32 characters |
+| `ALLOWED_MODELS` | `deepseek-v4-flash` | Ordered comma-separated model allowlist |
+| `DEFAULT_MODEL` | first allowed model | Must also appear in `ALLOWED_MODELS` |
+| `ST_API_BASE` | `http://sso-sidecar:8001/v1` | Internal URL written into managed users' custom API settings |
+| `API_MAX_BODY_BYTES` | `10485760` | Maximum relay JSON body size |
 
-SillyTavern 容器必须能够访问 `ST_API_BASE`。不要将它指向受 Authentik
-保护的公共浏览器 URL：SillyTavern 会从服务端发起自定义 API 请求。Sidecar
-会通过 SillyTavern 自身的已认证密钥 API，将 `API_PROXY_TOKEN`（而非真实
-API 密钥）写入受管用户的 `api_key_custom` 密钥。
+`ST_API_BASE` must be reachable from the SillyTavern container. Do not point it
+at a public Authentik-protected browser URL: SillyTavern performs custom API
+requests server-side. The sidecar writes `API_PROXY_TOKEN`, not the real API
+key, into the managed user's `api_key_custom` secret through SillyTavern's own
+authenticated secrets API.
 
-每个密钥都支持 Docker/Kubernetes 风格的文件变量。例如，可以设置
-`API_KEY_FILE=/run/secrets/api_key`，而不是 `API_KEY`。同一个密钥同时设置
-两种形式会被拒绝。
+Every secret supports a Docker/Kubernetes-style file variant. For example,
+set `API_KEY_FILE=/run/secrets/api_key` instead of `API_KEY`. Setting both forms
+for the same secret is rejected.
 
-可使用以下命令为各项生成彼此独立的随机值：
+Generate independent random values, for example:
 
 ```sh
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-启动时要求四个不同信任域的密钥彼此独立：如果上游密钥、中继令牌、管理员
-密码或受管用户派生密钥之间存在复用，Sidecar 会拒绝启动。
+Startup requires all four trust-domain secrets to be independent: it rejects
+reuse among the upstream key, relay token, administrator password, and
+managed-user derivation key.
 
-## Compose 示例
+## Compose example
 
-以下示例假设 Authentik outpost 地址为 `172.30.0.10`，Sidecar 地址为
-`172.30.0.20`，且 SillyTavern 和 outpost 都加入了同一个私有网络。不要直接
-发布 Sidecar 或 SillyTavern 的端口。
+This example assumes the Authentik outpost is `172.30.0.10`, the sidecar is
+`172.30.0.20`, and both SillyTavern and the outpost join the same private
+network. Do not publish the sidecar or SillyTavern ports directly.
 
 ```yaml
 services:
@@ -256,27 +318,34 @@ secrets:
     file: ./secrets/api_proxy_token
 ```
 
-### Linux 宿主机权限
+Point the Authentik proxy provider's internal host at
+`http://sso-sidecar:8001`. Make sure the network still permits the sidecar to
+reach the configured LLM provider, or attach a separate egress network.
 
-运行镜像会在依赖安装完成后移除 `pip`，并将 `/app/app.py` 设置为 root 所有、
-权限为 `0444`。运行用户只能写入状态目录。
+### Linux host permissions
 
-镜像以 UID/GID `10001:10001` 运行。建议使用示例中的 `sidecar_state` 命名
-卷，因为它不会用任意宿主机目录覆盖镜像中已正确设置所有者的状态目录。如果
-改用 `./sidecar-state:/var/lib/sso-sidecar` 之类的绑定挂载，请在启动前为
-容器用户创建源目录：
+The runtime image removes `pip` after dependency installation and installs
+`/app/app.py` as root-owned mode `0444`. Only the state directory is writable
+by the runtime user.
+
+The image runs as UID/GID `10001:10001`. The named `sidecar_state` volume in
+the example is recommended because it does not overlay the image-owned state
+directory with an arbitrary host directory. If you replace it with a bind
+mount such as `./sidecar-state:/var/lib/sso-sidecar`, create the source for the
+container user before startup:
 
 ```sh
 sudo install -d -o 10001 -g 10001 -m 0700 ./sidecar-state
 ```
 
-任何已有的 `mappings.json` 也必须允许 UID 10001 读写。Sidecar 会在同一目录
-中创建临时文件，再以原子方式替换 `mappings.json`，因此仅让该文件本身可写
-并不足够。
+Any existing `mappings.json` must also be readable and writable by UID 10001.
+The sidecar creates a temporary file in the same directory and atomically
+replaces `mappings.json`, so making only the file writable is insufficient.
 
-Docker Compose 会将顶层 `secrets.<name>.file` 源实现为绑定挂载。因此，容器
-用户必须能够遍历每一级父目录，而且每个密钥文件都必须允许 UID 或 GID 10001
-读取。针对本例中四个文件的一种最小权限配置如下：
+Docker Compose implements a top-level `secrets.<name>.file` source as a bind
+mount. Every parent directory must therefore be searchable by the container
+user, and each secret file must be readable by UID or GID 10001. One
+least-privilege setup for the four files in this example is:
 
 ```sh
 sudo chown root:10001 ./secrets ./secrets/*
@@ -284,35 +353,35 @@ sudo chmod 0750 ./secrets
 sudo chmod 0440 ./secrets/*
 ```
 
-不要在顶层密钥定义中放置 `mode`：该字段接受的是 `file` 等源类型，而不是
-挂载权限。服务级长语法虽然包含 `uid`、`gid` 和 `mode` 字段，但对于 `file`
-源，Docker Compose 会因使用绑定挂载而忽略这些字段。请改为设置宿主机文件的
-权限；[Compose 服务密钥参考](https://docs.docker.com/reference/compose-file/services/#secrets)
-记录了这一限制。
+Do not put `mode` under the top-level secret definitions: that field accepts a
+source such as `file`, not mount permissions. Service-level long syntax has
+`uid`, `gid`, and `mode` fields, but Docker Compose ignores them for a `file`
+source because it uses a bind mount. Set the permissions on the host files
+instead; the [Compose service-secrets reference](https://docs.docker.com/reference/compose-file/services/#secrets)
+documents this limitation.
 
-上述命令假设使用未启用用户命名空间重映射的 Linux Docker Engine。Rootless
-Docker、用户命名空间和 Docker Desktop 可能采用不同方式转换所有权；请验证
-运行中的容器能够读取每个已配置的 `*_FILE`，并写入 `STATE_FILE` 所在目录。
+These commands assume a Linux Docker Engine without user-namespace remapping.
+Rootless Docker, user namespaces, and Docker Desktop can translate ownership
+differently; verify that the running container can read every configured
+`*_FILE` and write the directory containing `STATE_FILE`.
 
-将 Authentik 代理提供程序的内部主机指向 `http://sso-sidecar:8001`。同时请
-确保网络仍允许 Sidecar 访问已配置的 LLM 提供商；也可以为其连接单独的出口
-网络。
+## Updating
 
-## 更新
+These steps assume the source-build Compose example above, a checkout at
+`./sso-sidecar`, and a service named `sso-sidecar`. Adapt the checkout path or
+service name if your deployment differs.
 
-以下步骤假设使用上面的源码构建 Compose 示例，代码检出路径为
-`./sso-sidecar`，服务名为 `sso-sidecar`。如果实际部署不同，请相应替换路径或
-服务名。
+### Before updating
 
-### 更新前
-
-1. 记录当前部署的修订版本，以便需要时重新构建并回滚：
+1. Record the currently deployed revision so that it can be rebuilt if a
+   rollback is needed:
 
    ```sh
    git -C ./sso-sidecar rev-parse HEAD
    ```
 
-2. 在原容器仍然存在时备份身份映射：
+2. Back up the identity mapping while the existing container is still
+   available:
 
    ```sh
    install -d -m 0700 ./backup
@@ -321,21 +390,25 @@ Docker、用户命名空间和 Docker Desktop 可能采用不同方式转换所�
      ./backup/mappings.json.pre-upgrade
    ```
 
-   如果尚未生成映射文件，可以跳过复制。备份中不含账户密码，但包含稳定身份
-   映射，仍应妥善保管。
+   Skip the copy if no mapping file exists yet. Keep the backup private: it
+   contains stable identity mappings, although it does not contain account
+   passwords.
 
-3. 保留现有 `sidecar_state` 卷和全部已配置密钥。尤其不能随意更换
-   `USER_PASSWORD_SECRET`，否则 Sidecar 将无法验证已有受管账户。更新过程中
-   不要运行 `docker compose down --volumes`。
+3. Keep the existing `sidecar_state` volume and all configured secrets. In
+   particular, changing `USER_PASSWORD_SECRET` prevents the sidecar from
+   verifying existing managed accounts. Do not run `docker compose down
+   --volumes` as part of an update.
 
-4. 对照[必需的 SillyTavern 配置](#sillytavern-必需配置)和当前环境变量表检查
-   部署。从早于 v0.3.0 的版本升级时，请确保已设置 `allowKeysExposure: false`
-   和 `sso.autheliaAuth: false`。现在，整数、布尔值、日志级别、URL 或密钥文件
-   配置无效时会在启动阶段清晰地失败，不再被隐式接受。
+4. Compare the deployment with [Required SillyTavern configuration](#required-sillytavern-configuration)
+   and the current environment-variable tables. When upgrading from a release
+   before v0.3.0, ensure that `allowKeysExposure: false` and
+   `sso.autheliaAuth: false` are present. Invalid integer, boolean, log-level,
+   URL, or secret-file settings now fail cleanly at startup instead of being
+   accepted implicitly.
 
-### 重建并替换 Sidecar
+### Rebuild and replace the sidecar
 
-在包含 Compose 文件的目录中运行：
+Run these commands from the directory containing the Compose file:
 
 ```sh
 git -C ./sso-sidecar switch main
@@ -346,16 +419,20 @@ docker compose up --detach --no-deps --wait sso-sidecar
 docker compose logs --tail=100 sso-sidecar
 ```
 
-如果修改了 SillyTavern 的必需设置，请先按照现有部署方式重启或重新创建
-SillyTavern，再测试 SSO。单独运行 `docker compose restart` 不会应用发生变化的
-镜像或环境变量，因此上面的流程使用 `up`。
+If the required SillyTavern settings changed, restart or recreate SillyTavern
+using that deployment's normal procedure before testing SSO. A plain
+`docker compose restart` does not apply changed image or environment
+configuration, which is why the commands above use `up`.
 
-确认服务健康后，依次测试普通用户 SSO 登录、适用时的管理员组用户登录以及已
-配置的 LLM 中继。v0.3.0 没有改变映射状态格式，无需手工迁移状态。
+Confirm that the service is healthy, then test an ordinary SSO login, an
+administrator-group login if applicable, and the configured LLM relay. v0.3.0
+does not change the mapping-state format, so no manual state migration is
+required.
 
-### 回滚
+### Rollback
 
-检出更新前记录的修订版本，重新构建镜像，并只重新创建 Sidecar：
+Check out the revision recorded before the update, rebuild the same service,
+and recreate only the sidecar:
 
 ```sh
 git -C ./sso-sidecar switch --detach <previous-revision>
@@ -364,32 +441,38 @@ docker compose up --detach --no-deps --wait sso-sidecar
 docker compose logs --tail=100 sso-sidecar
 ```
 
-不要删除状态卷。本次更新不要求恢复映射备份，应将其保留为恢复副本。如果未来
-版本明确更改了状态格式，请遵循该版本的迁移说明，并且只在 Sidecar 停止时恢复
-对应备份，同时保持 UID/GID 为 `10001:10001`。准备再次尝试升级时，运行
-`git -C ./sso-sidecar switch main`。
+Do not delete the state volume. This update does not require restoring the
+mapping backup; retain it as a recovery copy. If a future release explicitly
+changes the state format, follow that release's migration notes and restore a
+matching backup only while the sidecar is stopped, preserving UID/GID
+`10001:10001`. Run `git -C ./sso-sidecar switch main` when ready to retry the
+upgrade.
 
-## 映射与故障行为
+## Mapping and failure behavior
 
-- 状态文件中已有的 UID 始终映射到同一个 handle，即使 Authentik username 发生
-  变化，或新 username 无法转换为 ASCII handle 也是如此。
-- 一个 UID 不能重新绑定到另一个 handle，一个 handle 也不能绑定到多个 UID。
-- 预配或存储失败会返回 `503`，并在后续请求中重试。绝不会退回到直接传递
-  原始 Authentik username 的方式。
-- 从所有已配置管理员组中移除用户后，会在下一次未命中缓存的角色检查中降级
-  其映射账户；将用户加入任一管理员组则会提升权限。
-- 每次未命中缓存的同步都会验证受管账户的凭据；账户被删除后重新创建或密码
-  发生更改时，会在同步角色前拒绝继续。创建/配置序列中断后，处于待处理状态
-  的账户也可以恢复。请保持 `USER_PASSWORD_SECRET` 稳定，以便持续验证。
-- 受管用户的 API 配置带有指纹。轮换 `API_PROXY_TOKEN`、更改
-  `DEFAULT_MODEL` 或更改 `ST_API_BASE` 后，会在该用户下一次未命中缓存的
-  登录时重新应用设置与中继密钥。
-- 每个 `STATE_FILE` 只能运行一个 Sidecar 副本。水平扩展的副本需要使用独立
-  状态文件或外部事务性状态存储。
+- A UID already in the state file always maps to the same handle, even if the
+  Authentik username changes or the new username cannot form an ASCII handle.
+- One UID cannot be rebound to another handle, and one handle cannot be bound
+  to multiple UIDs.
+- A provisioning or storage failure returns `503` and is retried on a later
+  request. The original Authentik username is never passed through as a
+  fallback.
+- Removing a user from every configured admin group demotes the mapped account
+  on the next uncached role check; adding a group promotes it.
+- Managed accounts are credential-verified on every uncached reconciliation;
+  a deleted/re-created account or changed password fails closed before role
+  synchronization. Pending accounts can also resume after an interrupted
+  creation/config sequence. Keep `USER_PASSWORD_SECRET` stable so that
+  verification remains possible.
+- Managed-user API configuration is fingerprinted. Rotating
+  `API_PROXY_TOKEN`, changing `DEFAULT_MODEL`, or changing `ST_API_BASE`
+  reapplies the settings and relay secret on that user's next uncached login.
+- Run one sidecar replica per `STATE_FILE`. Horizontal replicas require
+  separate state files or an external transactional state store.
 
-## 开发
+## Development
 
-安装开发依赖并执行回归测试套件：
+Install the development dependencies and run the regression suite:
 
 ```sh
 python -m pip install -r requirements-dev.txt
@@ -399,16 +482,19 @@ python -m unittest discover -s tests -v
 python -m py_compile app.py
 ```
 
-测试套件覆盖中继身份验证与路由限制、编码路径遍历、有界分块请求体、替代身份
-请求头移除、严格 JSON 与模型校验、有界流式及压缩 SSO 请求体、受信任代理
-强制检查、原始 Cookie 保真、重定向改写、账户路由默认拒绝、按 UID 并发预配、
-清晰的启动错误、经过凭据验证的重试、不可变 UID 绑定、状态迁移、旧版记录
-健壮性以及 Authentik 组解析。
+The test suite covers relay authentication and route restrictions, encoded
+path traversal, bounded chunked bodies, alternative-identity header stripping,
+strict JSON and model validation, bounded streaming and compressed SSO bodies,
+trusted proxy enforcement, raw cookie preservation, redirect rewriting,
+fail-closed account routes, per-UID provisioning concurrency, clean startup
+errors, credential-verified retries, immutable UID bindings, state migration,
+legacy-record robustness, and Authentik group parsing.
 
-## 许可证
+## License
 
-[AGPL-3.0](LICENSE)，Copyright (C) 2026 YatsukiRenka。
+[AGPL-3.0](LICENSE), Copyright (C) 2026 YatsukiRenka.
 
-本项目是一个用户通过网络访问的反向代理，因此选用 AGPL-3.0 而非 GPL-3.0：
-任何人修改本项目并将其作为网络服务提供给用户，即使从不分发二进制，也必须向
-这些用户提供对应的完整源码。SillyTavern 本身同为 AGPL-3.0。
+This project is a reverse proxy that users reach over a network, so it uses
+AGPL-3.0 rather than GPL-3.0: anyone who modifies it and offers it to users as
+a network service must make the corresponding source available to those users,
+even if they never distribute a binary. SillyTavern itself is also AGPL-3.0.
